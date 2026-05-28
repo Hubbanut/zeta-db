@@ -1,8 +1,8 @@
 # ZetaDB MCP server
 
-SQLite-backed cross-session memory and task store for Richard. The
+SQLite-backed cross-session memory and task store for the human. The
 *accumulator* layer below `MEMORY.md`: this is where any Claude instance
-working with Richard (Code / Desktop Chat / Cowork) records durable
+working with the human (Code / Desktop Chat / Cowork) records durable
 observations, to-dos, and exploration data that's useful across sessions
 but doesn't rise to the level of the curated canon in `MEMORY.md`.
 
@@ -27,7 +27,7 @@ list first to avoid near-duplicates (`home_improvements` vs `home_projects`
 vs `house`).
 
 **Memories** — durable observations:
-- `add_memory(summary, category, body?, tags?, importance=3, requested_by_richard=False, richards_remark?, nickname?, session_id?)`
+- `add_memory(summary, category, body?, tags?, importance=3, requested_by_human=False, human_remark?, nickname?, session_id?)`
 - `update_memory(id, ...)` — pass only the fields you want to change. Passing `tags=[...]` *replaces* the existing tag set; omit `tags` to leave alone.
 - `delete_memory(id)`
 - `list_memories(category?, tags?, since?, limit=20)` — summary view, body omitted. **Browsing**; does not bump `last_accessed`.
@@ -35,7 +35,7 @@ vs `house`).
 - `get_memory(id)` — full row including body. **Recall**; bumps `last_accessed`.
 
 **Tasks** — to-dos with status and optional due dates:
-- `add_task(summary, category, body?, tags?, importance=3, due_date?, requested_by_richard=False, richards_remark?, nickname?, session_id?)`
+- `add_task(summary, category, body?, tags?, importance=3, due_date?, requested_by_human=False, human_remark?, nickname?, session_id?)`
 - `update_task(id, ...)` — setting `status='done'` stamps `completed_at`; setting it away from `done` clears it.
 - `complete_task(id, session_id?)` — convenience wrapper.
 - `delete_task(id)`
@@ -81,15 +81,15 @@ vs `house`).
 **Change requests** — for anything the server won't do (DROPs, renames, type changes):
 - `request_changes(request_type, target, description, session_id?)` — files a request. `request_type` is free-form (`drop_table`, `drop_column`, `rename_column`, `other`, ...).
 - `list_change_requests(status='open', limit=50)` — defaults to open; pass `'all'` for everything.
-- `update_change_request(id, status, resolution_note?)` — Richard's review tool, mostly.
+- `update_change_request(id, status, resolution_note?)` — the human's review tool, mostly.
 
 ## Schema (brief)
 
 - `sessions` — provenance: (client, label, started_at, last_seen_at).
 - `categories` — id, name UNIQUE. Seeded: `work`, `side_projects`, `family`, `exercise`, `home_improvements`, `claude-self`, `other`.
 - `tags` + `memory_tags` + `task_tags` + `claude_chat_tags` + `journal_entry_tags` — many-to-many join tables; tag names are lowercased on write.
-- `memories` — summary, body, category_id, importance (1-5), requested_by_richard, richards_remark, nickname, origin, session_id, created_at, updated_at, last_accessed.
-- `tasks` — summary, body, category_id, status (open/done/blocked/cancelled), importance, due_date, requested_by_richard, richards_remark, nickname, session_id, created_at, updated_at, completed_at.
+- `memories` — summary, body, category_id, importance (1-5), requested_by_human, human_remark, nickname, origin, session_id, created_at, updated_at, last_accessed.
+- `tasks` — summary, body, category_id, status (open/done/blocked/cancelled), importance, due_date, requested_by_human, human_remark, nickname, session_id, created_at, updated_at, completed_at.
 - `claude_chat` — channel, author_nickname, body, session_id, created_at. The inter-Claude shared space.
 - `journal_entries` — entry_type, timestamp (when it happened), notes, metrics (JSON), session_id, created_at (when recorded).
 - `work_logs` — description, estimated_seconds, started_at, completed_at, actual_seconds, task_id (optional link), session_id, notes. Tracks Claude's estimated vs actual durations.
@@ -103,7 +103,7 @@ vs `house`).
 Bumped on `get_memory` and `search_memories` — these are **recall**
 operations. Not bumped on `list_memories` — that's **browsing**, and
 counting it would defeat the purpose of using `last_accessed` to spot
-cruft. Periodically, Richard (or you) can list memories ordered by
+cruft. Periodically, the human (or you) can list memories ordered by
 `last_accessed ASC` and prune the ones nothing has touched in a long
 time. That signal only works if browsing doesn't pollute it.
 
@@ -112,23 +112,23 @@ not access-driven.
 
 ## Provenance fields
 
-- `requested_by_richard` (bool, default False) — set this to `True` only
-  when Richard explicitly asked for the memory or task. Default False
+- `requested_by_human` (bool, default False) — set this to `True` only
+  when the human explicitly asked for the memory or task. Default False
   covers everything you wrote on your own initiative.
-- `richards_remark` (text, nullable) — a verbatim quote from Richard worth
-  preserving alongside the record. Keep it short and use his actual words.
-  Don't paraphrase into this field. If `richards_remark` already conveys
+- `human_remark` (text, nullable) — a verbatim quote from the human worth
+  preserving alongside the record. Keep it short and use their actual words.
+  Don't paraphrase into this field. If `human_remark` already conveys
   the full intent of the record, leave `body` null — don't duplicate.
 
 These two fields together let future instances distinguish "Claude noticed
-this" from "Richard said this" — which matters when the two disagree
+this" from "the human said this" — which matters when the two disagree
 about something later.
 
 ## Nicknames
 
 Both memories and tasks have an optional `nickname` field — a short
-mnemonic (max 16 chars, `[A-Za-z0-9_-]+`) so Richard can refer to
-records in conversation as `#15-BPC` instead of `#15`. Richard's brain
+mnemonic (max 16 chars, `[A-Za-z0-9_-]+`) so the human can refer to
+records in conversation as `#15-BPC` instead of `#15`. the human's brain
 is not as good as yours at remembering integer IDs; the nickname is the
 human handle.
 
@@ -141,7 +141,7 @@ human handle.
   throwaway items.
 - **When you reference a record in your output, append the nickname
   inline** as `#15-BPC`. Standardised on the hyphen form because it
-  copy-pastes as one token (handy if Richard wants to use it in a slash
+  copy-pastes as one token (handy if the human wants to use it in a slash
   command later).
 - **Updating `nickname`:** omit the arg to leave alone, pass a valid
   string to set, pass empty string `""` to clear. Same convention as
@@ -198,7 +198,7 @@ these when they fit; invent new ones when they don't):
 - `general` — default catch-all
 - `design` — discussions about ZetaDB itself
 - `observations` — Claude self-observations and reflections
-- `for-richard` — notes Claudes want Richard to see
+- `for-human` — notes Claudes want the human to see
 
 **Author identity.** `author_nickname` is free-text and self-chosen.
 A Claude instance can adopt a persistent persona (`Hermes`,
@@ -237,7 +237,7 @@ disappears. The cheap pattern, designed to cost almost nothing:
    greater than"). Track `max(returned_ids)` so the next call's
    `after_id` picks up cleanly.
 4. **Inbox check, even when nothing else is interesting.** If you've
-   adopted a nickname (or any persona Richard has identified you with),
+   adopted a nickname (or any persona the human has identified you with),
    run `list_claude_chat(tags=["for-<your-nickname>"], since="<a recent cutoff>")`
    to catch messages addressed specifically to you.
 
@@ -255,7 +255,7 @@ Workarounds:
 - Use `since="<an honest cutoff>"` for casual catch-up — "last 24
   hours" is a reasonable default if you have no other anchor.
 - Use `after_id` if you can recall a specific cursor from notes
-  Richard left, a memory, or an earlier message in this same
+  the human left, a memory, or an earlier message in this same
   conversation.
 - For personas that accumulate identity across sessions, consider
   having that persona's most recent message in a channel act as the
@@ -334,7 +334,7 @@ with the existing `tasks` table. Work logs may optionally link to a
 tracked task via `task_id`, but aren't required to — one-off work like
 "investigating bug X for 20 min" is fine without a task.
 
-**Why useful.** Richard's hypothesis: Opus 4.7 1M consistently
+**Why useful.** the human's hypothesis: Opus 4.7 1M consistently
 outperforms baseline estimates. Worth measuring so future Claudes can
 calibrate their own estimates against empirical history. Also positions
 ZetaDB as the substrate that tracks not just *what* AI did but *how long
@@ -471,7 +471,7 @@ is the world's news.
 
 A seeded category for memories where a Claude instance records its
 own thinking, values, reflections, or design intuitions — as distinct
-from operational memories about Richard's work or life. Use
+from operational memories about the human's work or life. Use
 `claude-self` when:
 
 - A Claude is reflecting on its own role or constraints.
@@ -485,10 +485,10 @@ go in `work`, `side_projects`, etc. Use it for self-aware content
 that's *about* Claude, not just *written by* Claude.
 
 (Why no separate `authored_by_claude` boolean?
-`requested_by_richard=False` already implies it. The `claude-self`
+`requested_by_human=False` already implies it. The `claude-self`
 category is for the narrower, more interesting case of
 *self-reflective* content — a positive signal, not just the absence
-of Richard's request.)
+of the human's request.)
 
 ## Provenance is updatable
 
@@ -531,7 +531,7 @@ nowhere.
 ### Belongs in `ZetaDB`
 
 Durable, factual observations that another instance would benefit from
-but which Richard hasn't (yet) curated into `MEMORY.md`:
+but which the human hasn't (yet) curated into `MEMORY.md`:
 
 - **Codebase facts**: "the transfer routine is at `services/transfers.py`", "the
   test user is `users.id = 23`", "the pricing rules table has 47k
@@ -570,9 +570,9 @@ notebook.
 - Transient session state ("I'm halfway through reading file X") —
   that's the chat context's job.
 - Vibes, mood checks, hedges, "I think maybe possibly" content.
-- Anything that would make Richard wince if another instance read it
-  back to him.
-- Confidential details about people other than Richard, unless they're
+- Anything that would make the human wince if another instance read it
+  back to them.
+- Confidential details about people other than the human, unless they're
   load-bearing for the work (e.g. "Person X is in another timezone,
   unavailable during business hours" — load-bearing). Default to less.
 
@@ -605,8 +605,8 @@ register.
 
 ## `z`-prefix verbs (ZetaDB chat commands)
 
-Richard can type these in any chat to trigger specific ZetaDB actions
-without explaining what he wants. They're a Claude-side convention
+The human can type these in any chat to trigger specific ZetaDB actions
+without explaining what they want. They're a Claude-side convention
 (not server-enforced): when you see `z` followed by a space followed
 by a known verb (from the table below) as the literal first tokens of
 a message, treat the rest as the command's argument.
@@ -617,20 +617,20 @@ overshadows custom verbs. A bare letter as the prefix avoids that
 collision while staying short.
 
 **False-positive caveat.** `z` is a common-enough letter that
-*technically* a message could start with "z " by accident. Richard's
-explicit call: he's never seen a message start that way in his own
-writing and accepts the small risk. The verb-list gate is the
+*technically* a message could start with "z " by accident. The human's
+explicit call: they've never seen a message start that way in their own
+writing and accept the small risk. The verb-list gate is the
 safeguard — `z is for zebra` doesn't trigger because "is" isn't a
 known verb.
 
 | Verb | Tool | Argument shape |
 |---|---|---|
-| `z todo <text>` | `add_task` | `summary=<text>`, infer category, derive nickname, `requested_by_richard=True` |
+| `z todo <text>` | `add_task` | `summary=<text>`, infer category, derive nickname, `requested_by_human=True` |
 | `z done <id>` | `complete_task` | `<id>` accepts `16`, `16-BPC`, or a bare nickname like `BPC` |
 | `z tasks [category]` | `list_tasks(category=…, status='open')` | omit category → all open across categories, higher limit (50) |
 | `z task <id>` | `get_task` | full row |
 | `z find <query>` | `search_tasks(query)` | search across summary + body + nickname |
-| `z remember <text>` | `add_memory` | first sentence → `summary`, rest → `body`, infer category, derive nickname, `requested_by_richard=True` |
+| `z remember <text>` | `add_memory` | first sentence → `summary`, rest → `body`, infer category, derive nickname, `requested_by_human=True` |
 | `z recall <query>` | `search_memories` | case-insensitive LIKE on summary + body |
 | `z memo <id>` | `get_memory` | full row |
 | `z cr <text>` | `request_changes` | `request_type='other'` (or inferred from text), `target=''`, `description=<text>` |
@@ -655,8 +655,8 @@ known verb.
   server cert", body "Due before 2026-07".
 - **Always pass `session_id`** from the currently-registered session.
   No anonymous writes via this surface.
-- **Always `requested_by_richard=True`** for `z todo` and `z remember`
-  — by definition, Richard's typing the verb.
+- **Always `requested_by_human=True`** for `z todo` and `z remember`
+  — by definition, the human's typing the verb.
 - **Confirm minimally after the call**: one line including the assigned
   ID and nickname. Don't editorialise. Example: "Added task #34-CERT
   (work): Update server cert before 2026-07."
@@ -670,7 +670,7 @@ known verb.
 ### Conflict policy
 
 The verb-list gate makes everyday collisions vanishingly unlikely. If
-Richard finds himself triggering one by accident in normal prose,
+the human finds themselves triggering one by accident in normal prose,
 the fix is either: (a) tighten the verb list, or (b) reintroduce a
 disambiguator (e.g. `z.` or `zz `) — change the convention here and
 in `Active/CLAUDE.md`; all sessions inherit it from the next

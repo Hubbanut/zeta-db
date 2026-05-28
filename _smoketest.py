@@ -97,8 +97,8 @@ m1 = add_memory(
     body="HDDs in the cache path eat the latency budget; stick to SSDs.",
     tags=["hardware", "cache"],
     importance=5,
-    requested_by_richard=True,
-    richards_remark="No spinning disks on the cache path",
+    requested_by_human=True,
+    human_remark="No spinning disks on the cache path",
     session_id=SID,
 )
 check("add_memory returns id", isinstance(m1.get("id"), int), str(m1))
@@ -160,9 +160,9 @@ check("get_memory returns full row including body",
       got.get("body") is not None and got.get("category") == "work")
 check("get_memory hydrates tags",
       "hardware" in got.get("tags", []))
-check("get_memory exposes requested_by_richard as bool",
-      got.get("requested_by_richard") is True)
-check("get_memory exposes richards_remark", got.get("richards_remark") is not None)
+check("get_memory exposes requested_by_human as bool",
+      got.get("requested_by_human") is True)
+check("get_memory exposes human_remark", got.get("human_remark") is not None)
 
 initial_last_accessed = got["last_accessed"]
 time.sleep(1.1)
@@ -245,7 +245,7 @@ t1 = add_task(
     tags=["mcp", "infra"],
     importance=4,
     due_date="2026-05-20",
-    requested_by_richard=True,
+    requested_by_human=True,
     session_id=SID,
 )
 check("add_task returns id", isinstance(t1.get("id"), int))
@@ -269,10 +269,10 @@ check("list_tasks returns open tasks for category",
 check("list_tasks returns summary view",
       all("body" not in t for t in listed_t["tasks"]))
 
-upd_t = update_task(TID, status="blocked", richards_remark="waiting on review",
+upd_t = update_task(TID, status="blocked", human_remark="waiting on review",
                     session_id=SID)
 check("update_task changes status", upd_t.get("status") == "blocked")
-check("update_task preserves richards_remark", upd_t.get("richards_remark") == "waiting on review")
+check("update_task preserves human_remark", upd_t.get("human_remark") == "waiting on review")
 
 bad = update_task(TID, status="invalid")
 check("update_task rejects bad status", "error" in bad)

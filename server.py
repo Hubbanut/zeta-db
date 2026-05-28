@@ -1,7 +1,7 @@
 """ZetaDB cross-session memory MCP server.
 
 A SQLite-backed accumulator layer below MEMORY.md for any Claude instance
-working with Richard (Code, Desktop Chat, Cowork). Holds durable memories,
+working with the human (Code, Desktop Chat, Cowork). Holds durable memories,
 to-do lists, journal entries, inter-Claude chat, work-log durations, an
 audit trail, and persona-keyed subscriptions.
 
@@ -16,9 +16,9 @@ Identity:
     marked anonymous.
 
 Provenance fields on memories/tasks:
-  - requested_by_richard (bool): True when Richard explicitly asked for
+  - requested_by_human (bool): True when the human explicitly asked for
     the write; False when Claude wrote it on its own initiative.
-  - richards_remark (text, nullable): a verbatim quote from Richard worth
+  - human_remark (text, nullable): a verbatim quote from the human worth
     preserving alongside the record.
 
 Schema flexibility:
@@ -26,7 +26,7 @@ Schema flexibility:
     schema during the exploration phase. DDL takes structured args, never
     raw SQL.
   - DROPs of any kind are blocked. Such requests must be filed via
-    request_changes for Richard to review.
+    request_changes for the human to review.
   - Every schema change is logged to schema_history.
 
 Two-tier retrieval:
@@ -190,9 +190,9 @@ def _init_schema() -> None:
                 category_id           INTEGER NOT NULL REFERENCES categories(id),
                 importance            INTEGER NOT NULL DEFAULT 3
                                           CHECK (importance BETWEEN 1 AND 5),
-                requested_by_richard  INTEGER NOT NULL DEFAULT 0
-                                          CHECK (requested_by_richard IN (0, 1)),
-                richards_remark       TEXT,
+                requested_by_human  INTEGER NOT NULL DEFAULT 0
+                                          CHECK (requested_by_human IN (0, 1)),
+                human_remark       TEXT,
                 nickname              TEXT,
                 origin                TEXT,
                 session_id            INTEGER REFERENCES sessions(id),
@@ -217,9 +217,9 @@ def _init_schema() -> None:
                 importance            INTEGER NOT NULL DEFAULT 3
                                           CHECK (importance BETWEEN 1 AND 5),
                 due_date              TEXT,
-                requested_by_richard  INTEGER NOT NULL DEFAULT 0
-                                          CHECK (requested_by_richard IN (0, 1)),
-                richards_remark       TEXT,
+                requested_by_human  INTEGER NOT NULL DEFAULT 0
+                                          CHECK (requested_by_human IN (0, 1)),
+                human_remark       TEXT,
                 nickname              TEXT,
                 session_id            INTEGER REFERENCES sessions(id),
                 created_at            TEXT NOT NULL,
@@ -377,6 +377,36 @@ def _init_schema() -> None:
         if not _has_column("memories", "origin"):
             cur.execute("ALTER TABLE memories ADD COLUMN origin TEXT")
 
+        # Migration 2026-05-28: rename the project-maintainer-specific
+        # field names to generic ones describing the human collaborator.
+        #   requested_by_richard → requested_by_human
+        #   richards_remark      → human_remark
+        # Idempotent: only renames if the old column still exists.
+        for _table in ("memories", "tasks"):
+            if _has_column(_table, "requested_by_richard"):
+                cur.execute(
+                    f"ALTER TABLE {_table} "
+                    "RENAME COLUMN requested_by_richard TO requested_by_human"
+                )
+            if _has_column(_table, "richards_remark"):
+                cur.execute(
+                    f"ALTER TABLE {_table} "
+                    "RENAME COLUMN richards_remark TO human_remark"
+                )
+        # Audit-trail field_changed labels reference the old column names
+        # on rows recorded before this migration. Rewrite the labels so
+        # `get_audit_trail` queries return a consistent history under the
+        # new field names. (The old/new JSON snapshots are point-in-time
+        # records and stay as-they-were.)
+        cur.execute(
+            "UPDATE audit_trail SET field_changed = 'requested_by_human' "
+            "WHERE field_changed = 'requested_by_richard'"
+        )
+        cur.execute(
+            "UPDATE audit_trail SET field_changed = 'human_remark' "
+            "WHERE field_changed = 'richards_remark'"
+        )
+
         # Partial unique index: a nickname can only be reused once a task
         # has left an "active" status (open/blocked). Completed and
         # cancelled tasks free up their nickname for future reuse.
@@ -473,13 +503,13 @@ def _get_tags(
 def _hydrate_memory(conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool) -> dict[str, Any]:
     d = dict(row)
     d["category"] = _category_name(conn, d.pop("category_id"))
-    d["requested_by_richard"] = bool(d["requested_by_richard"])
+    d["requested_by_human"] = bool(d["requested_by_human"])
     d["tags"] = _get_tags(conn, "memory_tags", "memory_id", d["id"])
     # nickname and origin stay in both full and summary views — both
     # are scan-time identifiers.
     if not full:
         d.pop("body", None)
-        d.pop("richards_remark", None)
+        d.pop("human_remark", None)
         d.pop("session_id", None)
         d.pop("created_at", None)
         d.pop("last_accessed", None)
@@ -514,12 +544,12 @@ def _hydrate_journal(
 def _hydrate_task(conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool) -> dict[str, Any]:
     d = dict(row)
     d["category"] = _category_name(conn, d.pop("category_id"))
-    d["requested_by_richard"] = bool(d["requested_by_richard"])
+    d["requested_by_human"] = bool(d["requested_by_human"])
     d["tags"] = _get_tags(conn, "task_tags", "task_id", d["id"])
     # nickname stays in both full and summary views — it's the point.
     if not full:
         d.pop("body", None)
-        d.pop("richards_remark", None)
+        d.pop("human_remark", None)
         d.pop("session_id", None)
         d.pop("created_at", None)
     return d
@@ -991,8 +1021,8 @@ def add_memory(
     body: str | None = None,
     tags: list[str] | None = None,
     importance: int = 3,
-    requested_by_richard: bool = False,
-    richards_remark: str | None = None,
+    requested_by_human: bool = False,
+    human_remark: str | None = None,
     nickname: str | None = None,
     origin: str | None = None,
     session_id: str | None = None,
@@ -1005,15 +1035,15 @@ def add_memory(
         category: Must already exist (call list_categories / add_category first).
         body: Optional long-form content. Use when there's context,
             background, sub-steps, or links to capture beyond the summary
-            or Richard's quote. If `richards_remark` already conveys the
+            or the human's quote. If `human_remark` already conveys the
             full intent, leave `body` null — don't duplicate it here.
         tags: Optional list of tags. Lowercased automatically.
         importance: 1-5, default 3.
-        requested_by_richard: True if Richard explicitly asked for this memory.
-        richards_remark: Verbatim quote from Richard worth preserving.
+        requested_by_human: True if the human explicitly asked for this memory.
+        human_remark: Verbatim quote from the human worth preserving.
             Keep it actually verbatim — don't paraphrase into this field.
         nickname: Optional short mnemonic (<=16 chars, [A-Za-z0-9_-]+) so
-            Richard can refer to this memory as e.g. `#42-OFFSETS` in
+            the human can refer to this memory as e.g. `#42-OFFSETS` in
             conversation. Memories are not uniqueness-checked on nickname
             (a much bigger pool than tasks), so nicknames here are
             decorative. Derive a 2-6 char mnemonic from the summary when
@@ -1044,7 +1074,7 @@ def add_memory(
             """
             INSERT INTO memories (
                 summary, body, category_id, importance,
-                requested_by_richard, richards_remark, nickname, origin,
+                requested_by_human, human_remark, nickname, origin,
                 session_id, created_at, updated_at, last_accessed
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -1053,8 +1083,8 @@ def add_memory(
                 body,
                 cat_id,
                 importance,
-                1 if requested_by_richard else 0,
-                richards_remark,
+                1 if requested_by_human else 0,
+                human_remark,
                 cleaned_nick,
                 (origin.strip() or None) if origin else None,
                 session_pk,
@@ -1071,8 +1101,8 @@ def add_memory(
             "summary": summary.strip(),
             "body": body,
             "importance": importance,
-            "requested_by_richard": bool(requested_by_richard),
-            "richards_remark": richards_remark,
+            "requested_by_human": bool(requested_by_human),
+            "human_remark": human_remark,
             "nickname": cleaned_nick,
             "origin": (origin.strip() or None) if origin else None,
             "category": category.strip().lower(),
@@ -1092,8 +1122,8 @@ def update_memory(
     category: str | None = None,
     tags: list[str] | None = None,
     importance: int | None = None,
-    requested_by_richard: bool | None = None,
-    richards_remark: str | None = None,
+    requested_by_human: bool | None = None,
+    human_remark: str | None = None,
     nickname: str | None = None,
     origin: str | None = None,
     session_id: str | None = None,
@@ -1155,17 +1185,17 @@ def update_memory(
                 return {"error": err}
             sets.append("importance = ?"); vals.append(importance)
             audit_changes.append(("importance", existing["importance"], importance))
-        if requested_by_richard is not None:
-            sets.append("requested_by_richard = ?")
-            vals.append(1 if requested_by_richard else 0)
+        if requested_by_human is not None:
+            sets.append("requested_by_human = ?")
+            vals.append(1 if requested_by_human else 0)
             audit_changes.append((
-                "requested_by_richard",
-                bool(existing["requested_by_richard"]),
-                bool(requested_by_richard),
+                "requested_by_human",
+                bool(existing["requested_by_human"]),
+                bool(requested_by_human),
             ))
-        if richards_remark is not None:
-            sets.append("richards_remark = ?"); vals.append(richards_remark)
-            audit_changes.append(("richards_remark", existing["richards_remark"], richards_remark))
+        if human_remark is not None:
+            sets.append("human_remark = ?"); vals.append(human_remark)
+            audit_changes.append(("human_remark", existing["human_remark"], human_remark))
         if nickname is not None:  # explicitly passed; "" means clear
             cleaned_nick, err = _clean_nickname(nickname)
             if err:
@@ -1214,8 +1244,8 @@ def delete_memory(id: int, session_id: str | None = None) -> dict[str, Any]:
             "summary": existing["summary"],
             "body": existing["body"],
             "importance": existing["importance"],
-            "requested_by_richard": bool(existing["requested_by_richard"]),
-            "richards_remark": existing["richards_remark"],
+            "requested_by_human": bool(existing["requested_by_human"]),
+            "human_remark": existing["human_remark"],
             "nickname": existing["nickname"],
             "origin": existing["origin"],
             "category": _category_name(conn, existing["category_id"]),
@@ -1274,7 +1304,7 @@ def list_memories(
         rows = conn.execute(
             f"""
             SELECT m.id, m.summary, m.category_id, m.importance,
-                   m.requested_by_richard, m.nickname, m.origin, m.updated_at
+                   m.requested_by_human, m.nickname, m.origin, m.updated_at
             FROM memories m
             {where_sql}
             ORDER BY m.updated_at DESC
@@ -1337,7 +1367,7 @@ def search_memories(
         rows = conn.execute(
             f"""
             SELECT m.id, m.summary, m.category_id, m.importance,
-                   m.requested_by_richard, m.nickname, m.origin, m.updated_at
+                   m.requested_by_human, m.nickname, m.origin, m.updated_at
             FROM memories m
             WHERE {' AND '.join(wheres)}
             ORDER BY m.importance DESC, m.updated_at DESC
@@ -1383,8 +1413,8 @@ def add_task(
     tags: list[str] | None = None,
     importance: int = 3,
     due_date: str | None = None,
-    requested_by_richard: bool = False,
-    richards_remark: str | None = None,
+    requested_by_human: bool = False,
+    human_remark: str | None = None,
     nickname: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
@@ -1396,16 +1426,16 @@ def add_task(
         category: Must already exist.
         body: Optional long-form detail. Use when there's context,
             sub-steps, background, or links to capture. If
-            `richards_remark` already conveys the full intent, leave
+            `human_remark` already conveys the full intent, leave
             `body` null — don't duplicate.
         tags: Optional list of tags.
         importance: 1-5, default 3.
         due_date: ISO-8601 date or datetime string. Optional.
-        requested_by_richard: True if Richard explicitly asked for this task.
-        richards_remark: Verbatim quote from Richard. Keep it actually
+        requested_by_human: True if the human explicitly asked for this task.
+        human_remark: Verbatim quote from the human. Keep it actually
             verbatim — don't paraphrase into this field.
         nickname: Optional short mnemonic (<=16 chars, [A-Za-z0-9_-]+) so
-            Richard can refer to this task as e.g. `#15-BPC` in
+            the human can refer to this task as e.g. `#15-BPC` in
             conversation. Soft-unique across active tasks (open + blocked):
             collisions with another active task are rejected. Done and
             cancelled tasks free up their nickname for reuse. Derive a 2-6
@@ -1433,7 +1463,7 @@ def add_task(
                 """
                 INSERT INTO tasks (
                     summary, body, category_id, status, importance, due_date,
-                    requested_by_richard, richards_remark, nickname, session_id,
+                    requested_by_human, human_remark, nickname, session_id,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -1443,8 +1473,8 @@ def add_task(
                     cat_id,
                     importance,
                     due_date,
-                    1 if requested_by_richard else 0,
-                    richards_remark,
+                    1 if requested_by_human else 0,
+                    human_remark,
                     cleaned_nick,
                     session_pk,
                     now,
@@ -1465,8 +1495,8 @@ def add_task(
             "body": body,
             "importance": importance,
             "due_date": due_date,
-            "requested_by_richard": bool(requested_by_richard),
-            "richards_remark": richards_remark,
+            "requested_by_human": bool(requested_by_human),
+            "human_remark": human_remark,
             "nickname": cleaned_nick,
             "status": "open",
             "category": category.strip().lower(),
@@ -1488,8 +1518,8 @@ def update_task(
     status: str | None = None,
     importance: int | None = None,
     due_date: str | None = None,
-    requested_by_richard: bool | None = None,
-    richards_remark: str | None = None,
+    requested_by_human: bool | None = None,
+    human_remark: str | None = None,
     nickname: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
@@ -1557,17 +1587,17 @@ def update_task(
             new_due = due_date or None
             sets.append("due_date = ?"); vals.append(new_due)
             audit_changes.append(("due_date", existing["due_date"], new_due))
-        if requested_by_richard is not None:
-            sets.append("requested_by_richard = ?")
-            vals.append(1 if requested_by_richard else 0)
+        if requested_by_human is not None:
+            sets.append("requested_by_human = ?")
+            vals.append(1 if requested_by_human else 0)
             audit_changes.append((
-                "requested_by_richard",
-                bool(existing["requested_by_richard"]),
-                bool(requested_by_richard),
+                "requested_by_human",
+                bool(existing["requested_by_human"]),
+                bool(requested_by_human),
             ))
-        if richards_remark is not None:
-            sets.append("richards_remark = ?"); vals.append(richards_remark)
-            audit_changes.append(("richards_remark", existing["richards_remark"], richards_remark))
+        if human_remark is not None:
+            sets.append("human_remark = ?"); vals.append(human_remark)
+            audit_changes.append(("human_remark", existing["human_remark"], human_remark))
         if nickname is not None:  # explicitly passed; "" means clear
             cleaned_nick, err = _clean_nickname(nickname)
             if err:
@@ -1623,8 +1653,8 @@ def delete_task(id: int, session_id: str | None = None) -> dict[str, Any]:
             "body": existing["body"],
             "importance": existing["importance"],
             "due_date": existing["due_date"],
-            "requested_by_richard": bool(existing["requested_by_richard"]),
-            "richards_remark": existing["richards_remark"],
+            "requested_by_human": bool(existing["requested_by_human"]),
+            "human_remark": existing["human_remark"],
             "nickname": existing["nickname"],
             "status": existing["status"],
             "category": _category_name(conn, existing["category_id"]),
@@ -1690,7 +1720,7 @@ def list_tasks(
         rows = conn.execute(
             f"""
             SELECT t.id, t.summary, t.category_id, t.status, t.importance,
-                   t.due_date, t.requested_by_richard, t.nickname,
+                   t.due_date, t.requested_by_human, t.nickname,
                    t.updated_at, t.completed_at
             FROM tasks t
             {where_sql}
@@ -1781,7 +1811,7 @@ def search_tasks(
         rows = conn.execute(
             f"""
             SELECT t.id, t.summary, t.category_id, t.status, t.importance,
-                   t.due_date, t.requested_by_richard, t.nickname,
+                   t.due_date, t.requested_by_human, t.nickname,
                    t.updated_at, t.completed_at
             FROM tasks t
             WHERE {' AND '.join(wheres)}
@@ -1942,7 +1972,7 @@ def add_column(
 
     Note: SQLite rejects adding a NOT NULL column without a default to a
     table that already has rows. If that bites, either provide a default or
-    request the change via request_changes for Richard to handle manually.
+    request the change via request_changes for the human to handle manually.
     """
     if not _is_safe_ident(table):
         return {"error": f"invalid table name {table!r}"}
@@ -1983,10 +2013,10 @@ def request_changes(
     description: str,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    """File a change request for Richard's review.
+    """File a change request for the human's review.
 
     This is the general feedback channel — not just for schema. Use it for
-    anything you'd want Richard's eyes on: schema changes the server
+    anything you'd want the human's eyes on: schema changes the server
     won't perform itself (DROPs, renames, type changes), bugs, docstring
     gaps, API design questions, convention shifts, design suggestions.
 
