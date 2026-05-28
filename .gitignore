@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
 memories.db
 memories.db-journal
 memories.db-wal

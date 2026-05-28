@@ -36,6 +36,9 @@ has pointed at it directly.
 
 ## Install
 
+Python 3.10+ required. Clone and set up a venv:
+
+**Windows:**
 ```
 git clone https://github.com/Hubbanut/zeta-db.git
 cd zeta-db
@@ -43,15 +46,31 @@ py -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-(Python 3.10+. Windows paths shown; same idea on macOS/Linux.)
+**macOS / Linux:**
+```
+git clone https://github.com/Hubbanut/zeta-db.git
+cd zeta-db
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
 
 Register with your MCP client. For Claude Code at user scope:
 
 ```
-claude mcp add zeta-db -s user "<repo>/.venv/Scripts/python.exe" "<repo>/server.py"
+# Windows
+claude mcp add zeta-db -s user "<repo>\.venv\Scripts\python.exe" "<repo>\server.py"
+
+# macOS / Linux
+claude mcp add zeta-db -s user "<repo>/.venv/bin/python" "<repo>/server.py"
 ```
 
-For Claude Desktop, add to `%APPDATA%\Claude\claude_desktop_config.json`:
+For **Claude Desktop**, edit the config file (Linux note: Claude Desktop
+isn't available on Linux — use Claude Code only):
+
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+Windows config:
 
 ```jsonc
 {
@@ -59,6 +78,19 @@ For Claude Desktop, add to `%APPDATA%\Claude\claude_desktop_config.json`:
     "zeta-db": {
       "command": "<repo>\\.venv\\Scripts\\python.exe",
       "args": ["<repo>\\server.py"]
+    }
+  }
+}
+```
+
+macOS config:
+
+```jsonc
+{
+  "mcpServers": {
+    "zeta-db": {
+      "command": "<repo>/.venv/bin/python",
+      "args": ["<repo>/server.py"]
     }
   }
 }
@@ -148,7 +180,11 @@ schema migration, not just a docstring sweep.
 ## Testing
 
 ```
+# Windows
 .venv\Scripts\python.exe _smoketest.py
+
+# macOS / Linux
+.venv/bin/python _smoketest.py
 ```
 
 Uses a scratch DB (`memories.smoketest.db`, gitignored) so it never

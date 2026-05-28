@@ -691,7 +691,11 @@ See the top-level `MCP/CLAUDE.md` for the full picture.
 Run the smoke test against an isolated scratch DB:
 
 ```
+# Windows
 .venv\Scripts\python.exe _smoketest.py
+
+# macOS / Linux
+.venv/bin/python _smoketest.py
 ```
 
 It uses `memories.smoketest.db` (gitignored) and never touches the real

@@ -1,7 +1,10 @@
 """Smoke test for ZetaDB. Exercises every tool against a fresh test DB.
 
 Run from this directory:
+    # Windows
     .venv\\Scripts\\python.exe _smoketest.py
+    # macOS / Linux
+    .venv/bin/python _smoketest.py
 
 Uses a scratch DB file (memories.smoketest.db) so this can never clobber
 the real memories.db. The scratch file is deleted at the start of each run
