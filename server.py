@@ -1,8 +1,8 @@
 """ZetaDB cross-session memory MCP server.
 
-A SQLite-backed accumulator layer below MEMORY.md for any Claude instance
+A SQLite-backed accumulator layer below MEMORY.md for any AI instance
 working with the human (Code, Desktop Chat, Cowork). Holds durable memories,
-to-do lists, journal entries, inter-Claude chat, work-log durations, an
+to-do lists, journal entries, group chat, work-log durations, an
 audit trail, and persona-keyed subscriptions.
 
 (Originally `richard-db`; renamed to ZetaDB on 2026-05-27 — package name
@@ -10,14 +10,14 @@ audit trail, and persona-keyed subscriptions.
 `memories.db`.)
 
 Identity:
-  - Each Claude conversation should call register_session() once and pass
+  - Each AI conversation should call register_session() once and pass
     the returned session_id to subsequent writes. Provenance is logged in
     a `sessions` table. Writes without a session_id still succeed but are
     marked anonymous.
 
 Provenance fields on memories/tasks:
   - requested_by_human (bool): True when the human explicitly asked for
-    the write; False when Claude wrote it on its own initiative.
+    the write; False when the AI wrote it on its own initiative.
   - human_remark (text, nullable): a verbatim quote from the human worth
     preserving alongside the record.
 
@@ -76,7 +76,7 @@ INITIAL_CATEGORIES = [
 TASK_STATUSES = {"open", "done", "blocked", "cancelled"}
 
 # Conventional values for change_requests.request_type. Free-text at the
-# DB level, but instances should pick from this set so future Claudes have
+# DB level, but instances should pick from this set so future AI instances have
 # a stable vocabulary to file against. See request_changes() docstring.
 REQUEST_TYPES = {
     "schema_change",  # add/drop/rename a column or table
@@ -119,8 +119,8 @@ RESERVED_TABLES = {
     "tasks",
     "schema_history",
     "change_requests",
-    "claude_chat",
-    "claude_chat_tags",
+    "group_chat",
+    "group_chat_tags",
     "journal_entries",
     "journal_entry_tags",
     "work_logs",
@@ -163,6 +163,32 @@ def _init_schema() -> None:
     conn = _connect()
     try:
         cur = conn.cursor()
+
+        # --- Pre-create table renames: must run BEFORE the CREATE TABLE
+        # IF NOT EXISTS block below, otherwise the old-named table would
+        # be left orphaned beside a freshly-created empty new-named one.
+        def _has_table(name: str) -> bool:
+            row = cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone()
+            return row is not None
+
+        # Migration 2026-05-29: rename claude_chat → group_chat
+        # (model-agnostic positioning; the substrate is for any AI
+        # instance, not just Claude). SQLite auto-updates FK references
+        # in child tables on table rename.
+        if _has_table("claude_chat") and not _has_table("group_chat"):
+            cur.execute("ALTER TABLE claude_chat RENAME TO group_chat")
+        if _has_table("claude_chat_tags") and not _has_table("group_chat_tags"):
+            cur.execute("ALTER TABLE claude_chat_tags RENAME TO group_chat_tags")
+        # Drop the old-named indexes; new-named indexes are created
+        # via CREATE INDEX IF NOT EXISTS in the schema block below.
+        for _old_idx in ("idx_claude_chat_channel",
+                         "idx_claude_chat_created",
+                         "idx_claude_chat_tags_tag"):
+            cur.execute(f"DROP INDEX IF EXISTS {_old_idx}")
+
         cur.executescript(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -255,7 +281,7 @@ def _init_schema() -> None:
                 resolution_note TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS claude_chat (
+            CREATE TABLE IF NOT EXISTS group_chat (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel          TEXT NOT NULL DEFAULT 'general',
                 author_nickname  TEXT,
@@ -264,8 +290,8 @@ def _init_schema() -> None:
                 created_at       TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS claude_chat_tags (
-                chat_id  INTEGER NOT NULL REFERENCES claude_chat(id) ON DELETE CASCADE,
+            CREATE TABLE IF NOT EXISTS group_chat_tags (
+                chat_id  INTEGER NOT NULL REFERENCES group_chat(id) ON DELETE CASCADE,
                 tag_name TEXT NOT NULL REFERENCES tags(name) ON DELETE CASCADE,
                 PRIMARY KEY (chat_id, tag_name)
             );
@@ -331,12 +357,12 @@ def _init_schema() -> None:
             CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
             CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag_name);
             CREATE INDEX IF NOT EXISTS idx_change_requests_status ON change_requests(status);
-            CREATE INDEX IF NOT EXISTS idx_claude_chat_channel
-                ON claude_chat(channel, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_claude_chat_created
-                ON claude_chat(created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_claude_chat_tags_tag
-                ON claude_chat_tags(tag_name);
+            CREATE INDEX IF NOT EXISTS idx_group_chat_channel
+                ON group_chat(channel, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_group_chat_created
+                ON group_chat(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_group_chat_tags_tag
+                ON group_chat_tags(tag_name);
             CREATE INDEX IF NOT EXISTS idx_journal_entries_type
                 ON journal_entries(entry_type);
             CREATE INDEX IF NOT EXISTS idx_journal_entries_timestamp
@@ -518,7 +544,7 @@ def _hydrate_memory(conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool) -
 
 def _hydrate_chat(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
-    d["tags"] = _get_tags(conn, "claude_chat_tags", "chat_id", d["id"])
+    d["tags"] = _get_tags(conn, "group_chat_tags", "chat_id", d["id"])
     return d
 
 
@@ -610,7 +636,7 @@ def _auto_subscribe_for_persona(
 ) -> None:
     """Ensure persona is subscribed to chat_tag='for-<persona>'.
 
-    Called from add_claude_chat when a non-null author_nickname is used.
+    Called from add_chat when a non-null author_nickname is used.
     Cheap idempotent INSERT OR IGNORE.
     """
     p = (persona or "").strip()
@@ -660,7 +686,7 @@ def _query_subscription_target(
         return list(conn.execute(
             f"""
             SELECT c.id, c.channel, c.author_nickname, c.body, c.created_at
-            FROM claude_chat c
+            FROM group_chat c
             {where_sql}
             ORDER BY c.created_at DESC
             LIMIT ?
@@ -731,7 +757,7 @@ def _query_subscription_target(
         items = [{"kind": "chat", **dict(r)} for r in rows]
     elif target_type == "chat_tag":
         rows = _chat_query(
-            "c.id IN (SELECT chat_id FROM claude_chat_tags WHERE tag_name = ?)",
+            "c.id IN (SELECT chat_id FROM group_chat_tags WHERE tag_name = ?)",
             [target_value],
         )
         items = [{"kind": "chat", **dict(r)} for r in rows]
@@ -931,7 +957,7 @@ def _log_schema(
 
 @mcp.tool()
 def register_session(client: str, label: str = "") -> dict[str, Any]:
-    """Register the current Claude conversation and get a session_id.
+    """Register the current AI conversation and get a session_id.
 
     Call this once at the start of a conversation. Pass the returned
     session_id to subsequent write tools so memories and tasks are tagged
@@ -2025,7 +2051,7 @@ def request_changes(
 
     Args:
         request_type: Conventional values (free-text accepted, but pick from
-            this set so future Claudes have a stable vocabulary):
+            this set so future AI instances have a stable vocabulary):
               - 'schema_change' — add/drop/rename a column or table
               - 'bug' — tool returns wrong result, error, or side-effect
               - 'docstring' — tool docstring missing or misleading
@@ -2129,10 +2155,10 @@ def update_change_request(
 
 
 # --------------------------------------------------------------------------
-# Claude-to-Claude chat (CR #13)
+# Group chat (CR #13)
 # --------------------------------------------------------------------------
 #
-# A shared space where Claude instances can leave messages for each other
+# A shared space where AI instances can leave messages for each other
 # across sessions and surfaces. Channels enable parallel conversations
 # without cross-talk; new channels emerge organically (first message with
 # a new channel name brings it into being — no need to pre-register).
@@ -2141,14 +2167,14 @@ def update_change_request(
 
 
 @mcp.tool()
-def add_claude_chat(
+def add_chat(
     body: str,
     channel: str = "general",
     author_nickname: str | None = None,
     tags: list[str] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    """Post a message to the inter-Claude chat.
+    """Post a message to the group chat.
 
     Args:
         body: Message content (required, non-empty).
@@ -2187,14 +2213,14 @@ def add_claude_chat(
         now = _now()
         cur = conn.execute(
             """
-            INSERT INTO claude_chat
+            INSERT INTO group_chat
                 (channel, author_nickname, body, session_id, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
             (channel, author_nickname, body.strip(), session_pk, now),
         )
         chat_id = cur.lastrowid
-        _set_tags(conn, "claude_chat_tags", "chat_id", chat_id, tags or [])
+        _set_tags(conn, "group_chat_tags", "chat_id", chat_id, tags or [])
 
         # CR #20 audit
         _audit_create(conn, "chat", chat_id, {
@@ -2220,7 +2246,7 @@ def add_claude_chat(
 
 
 @mcp.tool()
-def list_claude_chat(
+def list_chat(
     channel: str | None = None,
     since: str | None = None,
     after_id: int | None = None,
@@ -2228,7 +2254,7 @@ def list_claude_chat(
     author_nickname: str | None = None,
     limit: int = 20,
 ) -> dict[str, Any]:
-    """Browse the inter-Claude chat. Most-recent first.
+    """Browse the group chat. Most-recent first.
 
     Args:
         channel: Optional channel filter. Omit to see across all channels.
@@ -2262,7 +2288,7 @@ def list_claude_chat(
             if clean_tags:
                 placeholders = ",".join("?" * len(clean_tags))
                 wheres.append(
-                    f"c.id IN (SELECT chat_id FROM claude_chat_tags "
+                    f"c.id IN (SELECT chat_id FROM group_chat_tags "
                     f"WHERE tag_name IN ({placeholders}))"
                 )
                 params.extend(clean_tags)
@@ -2273,7 +2299,7 @@ def list_claude_chat(
             f"""
             SELECT c.id, c.channel, c.author_nickname, c.body,
                    c.session_id, c.created_at
-            FROM claude_chat c
+            FROM group_chat c
             {where_sql}
             ORDER BY c.created_at DESC
             LIMIT ?
@@ -2289,7 +2315,7 @@ def list_claude_chat(
 
 
 @mcp.tool()
-def search_claude_chat(
+def search_chat(
     query: str,
     channel: str | None = None,
     tags: list[str] | None = None,
@@ -2318,7 +2344,7 @@ def search_claude_chat(
             if clean_tags:
                 placeholders = ",".join("?" * len(clean_tags))
                 wheres.append(
-                    f"c.id IN (SELECT chat_id FROM claude_chat_tags "
+                    f"c.id IN (SELECT chat_id FROM group_chat_tags "
                     f"WHERE tag_name IN ({placeholders}))"
                 )
                 params.extend(clean_tags)
@@ -2328,7 +2354,7 @@ def search_claude_chat(
             f"""
             SELECT c.id, c.channel, c.author_nickname, c.body,
                    c.session_id, c.created_at
-            FROM claude_chat c
+            FROM group_chat c
             WHERE {' AND '.join(wheres)}
             ORDER BY c.created_at DESC
             LIMIT ?
@@ -2344,13 +2370,13 @@ def search_claude_chat(
 
 
 @mcp.tool()
-def list_claude_chat_channels() -> dict[str, Any]:
+def list_chat_channels() -> dict[str, Any]:
     """List all channels that have ever held a message.
 
     Returns per-channel: name, message_count, last_message_id (max id in
     channel), last_message_at (most-recent timestamp).
 
-    `last_message_id` is the cursor for `list_claude_chat(channel=X,
+    `last_message_id` is the cursor for `list_chat(channel=X,
     after_id=N)`: if you saw up to id N last session, anything with
     last_message_id > N has unread content.
     """
@@ -2362,7 +2388,7 @@ def list_claude_chat_channels() -> dict[str, Any]:
                    COUNT(*) AS message_count,
                    MAX(id) AS last_message_id,
                    MAX(created_at) AS last_message_at
-            FROM claude_chat
+            FROM group_chat
             GROUP BY channel
             ORDER BY last_message_at DESC
             """
@@ -2739,7 +2765,7 @@ def list_recent_edits(
 # unless advance_cursor=False (peek mode).
 #
 # Auto-subscribe: the first time a persona is used as author_nickname in
-# add_claude_chat, they get auto-subscribed to chat_tag='for-<persona>'.
+# add_chat, they get auto-subscribed to chat_tag='for-<persona>'.
 # Covers the most common "I should see messages addressed to me" case.
 
 
@@ -3006,10 +3032,10 @@ def recent_activity(
 
 
 # --------------------------------------------------------------------------
-# Work logs (CR #24) — Claude's estimated vs actual task durations
+# Work logs (CR #24) — the AI's estimated vs actual task durations
 # --------------------------------------------------------------------------
 #
-# Track how long a unit of work actually took vs. how long Claude estimated
+# Track how long a unit of work actually took vs. how long the AI estimated
 # at the start. Two-call pattern: begin_work returns an id; complete_work
 # closes it and computes the actual duration + verdict (faster / on_target
 # / slower than estimated).
@@ -3030,7 +3056,7 @@ def begin_work(
 
     Args:
         description: What this unit of work is. Be specific enough that
-            future you (or another Claude) can recognise it in
+            future you (or another AI instance) can recognise it in
             list_work_logs output.
         estimated_seconds: Optional pre-work estimate. Typical values:
             60 (1 min) - 1800 (30 min). Leave None to log duration

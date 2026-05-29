@@ -34,15 +34,15 @@ for suffix in ("-journal", "-wal", "-shm"):
 
 sys.path.insert(0, str(HERE))
 from server import (  # noqa: E402
-    add_category, add_claude_chat, add_column, add_journal_entry,
+    add_category, add_chat, add_column, add_journal_entry,
     add_memory, add_task, begin_work, check_subscriptions,
     complete_task, complete_work, create_table, delete_memory,
     delete_task, describe_schema, get_audit_trail, get_memory,
     get_task, get_work_log, list_categories, list_change_requests,
-    list_claude_chat, list_claude_chat_channels, list_journal_entries,
+    list_chat, list_chat_channels, list_journal_entries,
     list_memories, list_recent_edits, list_subscriptions, list_tasks,
     list_work_logs, recent_activity, register_session, request_changes,
-    search_claude_chat, search_journal_entries, search_memories,
+    search_chat, search_journal_entries, search_memories,
     search_tasks, subscribe, tick_checklist, unsubscribe,
     update_change_request, update_memory, update_task,
 )
@@ -451,7 +451,7 @@ schema = describe_schema()
 core_tables = {t["name"] for t in schema["tables"] if t["reserved"]}
 check("describe_schema lists reserved core tables",
       {"memories", "tasks", "sessions", "schema_history",
-       "claude_chat", "journal_entries"}.issubset(core_tables))
+       "group_chat", "journal_entries"}.issubset(core_tables))
 
 made = create_table(
     "spike_observations",
@@ -548,92 +548,92 @@ check("schema_history logs add_column",
 
 
 # --------------------------------------------------------------------
-section("claude_chat (CR #13)")
+section("group_chat (CR #13)")
 
 # Post on default channel.
-msg1 = add_claude_chat(body="hello from session 1", session_id=SID,
+msg1 = add_chat(body="hello from session 1", session_id=SID,
                        author_nickname="Hermes")
-check("add_claude_chat returns id and channel",
+check("add_chat returns id and channel",
       isinstance(msg1.get("id"), int) and msg1.get("channel") == "general")
-check("add_claude_chat preserves explicit author_nickname",
+check("add_chat preserves explicit author_nickname",
       msg1.get("author_nickname") == "Hermes")
 
 # Post on a different channel.
-msg2 = add_claude_chat(body="design point: keep journal flexible",
+msg2 = add_chat(body="design point: keep journal flexible",
                        channel="design", tags=["journaling", "schema"],
                        session_id=SID2)
-check("add_claude_chat on new channel emerges organically",
+check("add_chat on new channel emerges organically",
       msg2.get("channel") == "design")
 
 # Author defaults to session label if not given.
-msg3 = add_claude_chat(body="anonymous-style post", channel="design",
+msg3 = add_chat(body="anonymous-style post", channel="design",
                        session_id=SID2)
-check("add_claude_chat falls back to session label as author",
+check("add_chat falls back to session label as author",
       msg3.get("author_nickname") == "second-author")
 
 # List by channel.
-listed_design = list_claude_chat(channel="design")
-check("list_claude_chat filters by channel",
+listed_design = list_chat(channel="design")
+check("list_chat filters by channel",
       all(m["channel"] == "design" for m in listed_design["messages"]))
-check("list_claude_chat returns expected message count for channel",
+check("list_chat returns expected message count for channel",
       listed_design["count"] == 2)
 
 # List across all channels.
-listed_all = list_claude_chat()
-check("list_claude_chat across all channels sees all 3", listed_all["count"] == 3)
+listed_all = list_chat()
+check("list_chat across all channels sees all 3", listed_all["count"] == 3)
 
 # List by author.
-listed_hermes = list_claude_chat(author_nickname="Hermes")
-check("list_claude_chat filters by author_nickname",
+listed_hermes = list_chat(author_nickname="Hermes")
+check("list_chat filters by author_nickname",
       listed_hermes["count"] == 1 and listed_hermes["messages"][0]["id"] == msg1["id"])
 
 # List by tag.
-listed_tag = list_claude_chat(tags=["journaling"])
-check("list_claude_chat filters by tag",
+listed_tag = list_chat(tags=["journaling"])
+check("list_chat filters by tag",
       listed_tag["count"] == 1 and listed_tag["messages"][0]["id"] == msg2["id"])
 
 # Search by body.
-searched = search_claude_chat("design point")
-check("search_claude_chat finds by body",
+searched = search_chat("design point")
+check("search_chat finds by body",
       any(m["id"] == msg2["id"] for m in searched["messages"]))
 
 # Search rejects empty.
-bad = search_claude_chat("")
-check("search_claude_chat rejects empty query", "error" in bad)
+bad = search_chat("")
+check("search_chat rejects empty query", "error" in bad)
 
 # Channels listing.
-channels = list_claude_chat_channels()
+channels = list_chat_channels()
 ch_names = {c["channel"] for c in channels["channels"]}
-check("list_claude_chat_channels returns both channels",
+check("list_chat_channels returns both channels",
       {"general", "design"}.issubset(ch_names))
 
-# CR #15: list_claude_chat_channels exposes last_message_id as the cursor.
-check("list_claude_chat_channels includes last_message_id",
+# CR #15: list_chat_channels exposes last_message_id as the cursor.
+check("list_chat_channels includes last_message_id",
       all("last_message_id" in c for c in channels["channels"]))
 
-# CR #15: after_id filter on list_claude_chat ("give me new since ID X").
+# CR #15: after_id filter on list_chat ("give me new since ID X").
 design_channel = next(c for c in channels["channels"] if c["channel"] == "design")
 # msg2 was the first design message, msg3 the second. after_id=msg2 should
 # return only msg3.
-new_only = list_claude_chat(channel="design", after_id=msg2["id"])
-check("list_claude_chat after_id returns only newer messages",
+new_only = list_chat(channel="design", after_id=msg2["id"])
+check("list_chat after_id returns only newer messages",
       new_only["count"] == 1 and new_only["messages"][0]["id"] == msg3["id"])
 
 # after_id at the channel's latest should return empty (nothing new).
-empty = list_claude_chat(channel="design", after_id=design_channel["last_message_id"])
-check("list_claude_chat after_id at last_message_id returns empty",
+empty = list_chat(channel="design", after_id=design_channel["last_message_id"])
+check("list_chat after_id at last_message_id returns empty",
       empty["count"] == 0)
 
 # Post a new message and verify cursor pattern picks it up.
-msg4 = add_claude_chat(body="newer design point", channel="design", session_id=SID)
-caught_up = list_claude_chat(channel="design",
+msg4 = add_chat(body="newer design point", channel="design", session_id=SID)
+caught_up = list_chat(channel="design",
                               after_id=design_channel["last_message_id"])
-check("list_claude_chat after_id catches new post via cursor",
+check("list_chat after_id catches new post via cursor",
       caught_up["count"] == 1 and caught_up["messages"][0]["id"] == msg4["id"])
 
 # Validation: empty body.
-bad = add_claude_chat(body="", session_id=SID)
-check("add_claude_chat rejects empty body", "error" in bad)
+bad = add_chat(body="", session_id=SID)
+check("add_chat rejects empty body", "error" in bad)
 
 
 # --------------------------------------------------------------------
@@ -872,7 +872,7 @@ check("journal create audited",
       any(e["operation"] == "create" for e in j_trail["events"]))
 
 # Chat create audited.
-c_aud = add_claude_chat(body="audit me chat", channel="general",
+c_aud = add_chat(body="audit me chat", channel="general",
                         author_nickname="Smoketest", session_id=SID)
 c_trail = get_audit_trail("chat", c_aud["id"])
 check("chat create audited",
@@ -910,18 +910,18 @@ subs = list_subscriptions("TestPersona")
 check("list_subscriptions returns subs",
       subs["count"] == 1 and subs["subscriptions"][0]["target_value"] == "design")
 
-# Auto-subscribe on add_claude_chat:
-add_claude_chat(body="seeding new persona Atlas",
+# Auto-subscribe on add_chat:
+add_chat(body="seeding new persona Atlas",
                 channel="general", author_nickname="Atlas-test",
                 session_id=SID)
 atlas_subs = list_subscriptions("Atlas-test")
 auto = [s for s in atlas_subs["subscriptions"]
         if s["target_type"] == "chat_tag" and s["target_value"] == "for-atlas-test"]
-check("add_claude_chat auto-subscribes author to for-<persona>",
+check("add_chat auto-subscribes author to for-<persona>",
       len(auto) == 1)
 
 # check_subscriptions: post in design AFTER subscribe → should surface.
-add_claude_chat(body="design message for testpersona", channel="design",
+add_chat(body="design message for testpersona", channel="design",
                 author_nickname="OtherClaude", session_id=SID)
 ping = check_subscriptions("TestPersona")
 check("check_subscriptions returns new items",
@@ -937,7 +937,7 @@ check("second ping shows cursor advanced (no new items)",
       ping2["total_new"] == 0)
 
 # Peek mode: doesn't advance cursor.
-add_claude_chat(body="another design msg", channel="design",
+add_chat(body="another design msg", channel="design",
                 author_nickname="OtherClaude", session_id=SID)
 peek = check_subscriptions("TestPersona", advance_cursor=False)
 check("check_subscriptions peek returns new item",
@@ -949,9 +949,9 @@ check("check_subscriptions peek doesn't advance cursor (same new item)",
 check_subscriptions("TestPersona")
 
 # Self-filtering: TestPersona's own posts shouldn't surface in their channel subs.
-add_claude_chat(body="own post in design", channel="design",
+add_chat(body="own post in design", channel="design",
                 author_nickname="TestPersona", session_id=SID)
-add_claude_chat(body="another's post in design", channel="design",
+add_chat(body="another's post in design", channel="design",
                 author_nickname="OtherClaude", session_id=SID)
 ping3 = check_subscriptions("TestPersona")
 design_items = next(s for s in ping3["subscriptions"]
