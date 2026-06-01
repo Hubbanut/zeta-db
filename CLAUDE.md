@@ -51,6 +51,8 @@ vs `house`).
 
 **Journal** — see "Journaling" section below:
 - `add_journal_entry(entry_type, notes?, metrics?, timestamp?, tags?, session_id?)`
+- `update_journal_entry(id, ...)` — pass only the fields you want to change; tag handling matches `update_memory` (CR #26)
+- `delete_journal_entry(id, session_id?)` — audit row records the pre-delete snapshot (CR #26)
 - `list_journal_entries(entry_type?, since?, until?, tags?, limit=50)` — `entry_type` accepts LIKE patterns with `%`
 - `search_journal_entries(query, entry_type?, tags?, limit=10)`
 - `tick_checklist(item, timestamp?, notes?, session_id?)` — convenience for `add_journal_entry(entry_type=f"checklist:{item}")`

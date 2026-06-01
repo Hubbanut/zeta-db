@@ -36,14 +36,15 @@ sys.path.insert(0, str(HERE))
 from server import (  # noqa: E402
     add_category, add_chat, add_column, add_journal_entry,
     add_memory, add_task, begin_work, check_subscriptions,
-    complete_task, complete_work, create_table, delete_memory,
-    delete_task, describe_schema, get_audit_trail, get_memory,
-    get_task, get_work_log, list_categories, list_change_requests,
-    list_chat, list_chat_channels, list_journal_entries,
-    list_memories, list_recent_edits, list_subscriptions, list_tasks,
-    list_work_logs, recent_activity, register_session, request_changes,
-    search_chat, search_journal_entries, search_memories,
-    search_tasks, subscribe, tick_checklist, unsubscribe,
+    complete_task, complete_work, create_table, delete_journal_entry,
+    delete_memory, delete_task, describe_schema, get_audit_trail,
+    get_memory, get_task, get_work_log, list_categories,
+    list_change_requests, list_chat, list_chat_channels,
+    list_journal_entries, list_memories, list_recent_edits,
+    list_subscriptions, list_tasks, list_work_logs, recent_activity,
+    register_session, request_changes, search_chat,
+    search_journal_entries, search_memories, search_tasks, subscribe,
+    tick_checklist, unsubscribe, update_journal_entry,
     update_change_request, update_memory, update_task,
 )
 
@@ -734,6 +735,64 @@ check("list_journal_entries finds checklist ticks under prefix",
 # Validation.
 bad = add_journal_entry(entry_type="", session_id=SID)
 check("add_journal_entry rejects empty entry_type", "error" in bad)
+
+
+# --------------------------------------------------------------------
+section("update_journal_entry / delete_journal_entry (CR #26)")
+
+je_upd = add_journal_entry(entry_type="life", notes="initial note",
+                           tags=["draft"], session_id=SID)
+JEUID = je_upd["id"]
+
+# Update notes.
+out = update_journal_entry(JEUID, notes="enriched note", session_id=SID)
+check("update_journal_entry changes notes", out.get("notes") == "enriched note")
+
+# Update entry_type (lowercased + stripped).
+out = update_journal_entry(JEUID, entry_type="  Release  ", session_id=SID)
+check("update_journal_entry strips + lowercases entry_type",
+      out.get("entry_type") == "release")
+
+# Replace metrics.
+out = update_journal_entry(JEUID, metrics={"v": "1.2.3"}, session_id=SID)
+check("update_journal_entry sets metrics",
+      isinstance(out.get("metrics"), dict) and out["metrics"].get("v") == "1.2.3")
+
+# Replace tags.
+out = update_journal_entry(JEUID, tags=["release", "milestone"], session_id=SID)
+check("update_journal_entry replaces tags",
+      set(out.get("tags", [])) == {"release", "milestone"})
+
+# Update rejects empty entry_type and timestamp.
+bad = update_journal_entry(JEUID, entry_type="")
+check("update_journal_entry rejects empty entry_type", "error" in bad)
+bad = update_journal_entry(JEUID, timestamp="")
+check("update_journal_entry rejects empty timestamp", "error" in bad)
+
+# Update not found.
+bad = update_journal_entry(99999, notes="nope")
+check("update_journal_entry not found", "error" in bad)
+
+# Audit trail captured the changes.
+j_audit = get_audit_trail("journal", JEUID)
+fields_seen = {e["field_changed"] for e in j_audit["events"]
+               if e["operation"] == "update"}
+check("update_journal_entry writes per-field audit rows",
+      {"notes", "entry_type", "metrics", "tags"}.issubset(fields_seen),
+      str(sorted(fields_seen)))
+
+# Delete + audit.
+d = delete_journal_entry(JEUID, session_id=SID)
+check("delete_journal_entry succeeds", d.get("deleted") is True)
+j_audit_after = get_audit_trail("journal", JEUID)
+delete_event = next((e for e in j_audit_after["events"]
+                     if e["operation"] == "delete"), None)
+check("delete_journal_entry writes audit row with snapshot",
+      delete_event is not None and delete_event["old_value"] is not None)
+
+# Delete not found.
+bad = delete_journal_entry(99999)
+check("delete_journal_entry not found", "error" in bad)
 
 
 # --------------------------------------------------------------------

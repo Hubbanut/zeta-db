@@ -2560,6 +2560,122 @@ def add_journal_entry(
 
 
 @mcp.tool()
+def update_journal_entry(
+    id: int,
+    entry_type: str | None = None,
+    notes: str | None = None,
+    metrics: dict[str, Any] | None = None,
+    timestamp: str | None = None,
+    tags: list[str] | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Update any subset of a journal entry's fields (CR #26).
+
+    Pass only the fields you want to change. If `tags` is provided (even
+    an empty list), it *replaces* the existing tag set; omit to leave
+    tags alone. Same for `metrics`: omit to leave alone, pass a dict
+    to replace the existing JSON (empty dict stores "{}").
+
+    `session_id` (when passed) is recorded as the most-recent author of
+    this row — replaces the row's session_id and bumps last_seen.
+
+    Args:
+        id: journal_entries.id.
+        entry_type: New entry_type (stripped + lowercased). Reject empty.
+        notes: New notes text. Pass-through, including "" for empty.
+        metrics: New metrics dict. Replaces the existing JSON when set.
+        timestamp: New ISO-8601 timestamp. Reject empty.
+        tags: Replacement tag set.
+        session_id: From register_session().
+    """
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT * FROM journal_entries WHERE id = ?", (id,)
+        ).fetchone()
+        if existing is None:
+            return {"error": "not found"}
+        old_tags = _get_tags(conn, "journal_entry_tags", "entry_id", id)
+        session_pk = _resolve_session(conn, session_id)
+
+        sets: list[str] = []
+        vals: list[Any] = []
+        audit_changes: list[tuple[str, Any, Any]] = []
+
+        if entry_type is not None:
+            if not entry_type.strip():
+                return {"error": "entry_type cannot be empty"}
+            new_et = entry_type.strip().lower()
+            sets.append("entry_type = ?"); vals.append(new_et)
+            audit_changes.append(("entry_type", existing["entry_type"], new_et))
+        if notes is not None:
+            sets.append("notes = ?"); vals.append(notes)
+            audit_changes.append(("notes", existing["notes"], notes))
+        if metrics is not None:
+            new_metrics_json = json.dumps(metrics)
+            sets.append("metrics = ?"); vals.append(new_metrics_json)
+            audit_changes.append(("metrics", existing["metrics"], new_metrics_json))
+        if timestamp is not None:
+            if not timestamp.strip():
+                return {"error": "timestamp cannot be empty"}
+            new_ts = timestamp.strip()
+            sets.append("timestamp = ?"); vals.append(new_ts)
+            audit_changes.append(("timestamp", existing["timestamp"], new_ts))
+        if session_id is not None:  # bookkeeping, not audit-worthy
+            sets.append("session_id = ?"); vals.append(session_pk)
+
+        if sets:
+            vals.append(id)
+            conn.execute(
+                f"UPDATE journal_entries SET {', '.join(sets)} WHERE id = ?",
+                vals,
+            )
+            for field, old, new in audit_changes:
+                _audit_field_change(conn, "journal", id, field, old, new, session_pk)
+
+        if tags is not None:
+            _set_tags(conn, "journal_entry_tags", "entry_id", id, tags)
+            _audit_tag_change(conn, "journal", id, old_tags, tags, session_pk)
+
+        row = conn.execute(
+            "SELECT * FROM journal_entries WHERE id = ?", (id,)
+        ).fetchone()
+        return _hydrate_journal(conn, row, full=True)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def delete_journal_entry(id: int, session_id: str | None = None) -> dict[str, Any]:
+    """Delete a journal entry by id (CR #26).
+
+    Audit row records the full pre-delete snapshot, mirroring
+    delete_memory / delete_task.
+    """
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT * FROM journal_entries WHERE id = ?", (id,)
+        ).fetchone()
+        if existing is None:
+            return {"error": "not found"}
+        old_tags = _get_tags(conn, "journal_entry_tags", "entry_id", id)
+        snapshot = {
+            "entry_type": existing["entry_type"],
+            "timestamp": existing["timestamp"],
+            "notes": existing["notes"],
+            "metrics": existing["metrics"],
+            "tags": sorted(old_tags),
+        }
+        session_pk = _resolve_session(conn, session_id)
+        conn.execute("DELETE FROM journal_entries WHERE id = ?", (id,))
+        _audit_delete(conn, "journal", id, snapshot, session_pk)
+        return {"deleted": True, "id": id}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def list_journal_entries(
     entry_type: str | None = None,
     since: str | None = None,
