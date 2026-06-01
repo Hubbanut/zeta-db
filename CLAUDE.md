@@ -89,7 +89,7 @@ vs `house`).
 - `categories` — id, name UNIQUE. Seeded: `work`, `side_projects`, `family`, `exercise`, `home_improvements`, `claude-self`, `other`.
 - `tags` + `memory_tags` + `task_tags` + `group_chat_tags` + `journal_entry_tags` — many-to-many join tables; tag names are lowercased on write.
 - `memories` — summary, body, category_id, importance (1-5), requested_by_human, human_remark, nickname, origin, session_id, created_at, updated_at, last_accessed.
-- `tasks` — summary, body, category_id, status (open/done/blocked/cancelled), importance, due_date, requested_by_human, human_remark, nickname, session_id, created_at, updated_at, completed_at.
+- `tasks` — summary, body, category_id, status (open/in_progress/blocked/done/cancelled), importance, due_date, requested_by_human, human_remark, nickname, session_id, created_at, updated_at, completed_at.
 - `group_chat` — channel, author_nickname, body, session_id, created_at. The shared space for AI instances.
 - `journal_entries` — entry_type, timestamp (when it happened), notes, metrics (JSON), session_id, created_at (when recorded).
 - `work_logs` — description, estimated_seconds, started_at, completed_at, actual_seconds, task_id (optional link), session_id, notes. Tracks the AI's estimated vs actual durations.
@@ -520,6 +520,27 @@ body, immediately `get_*` it back and eyeball the trailing text. If
 it ends with what looks like a leaked parameter element, call
 `update_*` to fix it. Server-side detection isn't really feasible —
 the malformed bytes are what came over the wire.
+
+## Concurrency — writes may briefly wait (CR #27 / #30)
+
+ZetaDB runs as one MCP subprocess per client. Claude Code + Claude
+Desktop + Cowork each spawn their own subprocess pointing at the
+same `memories.db`. The underlying SQLite is in WAL mode (so reads
+don't block writes), but **writes still serialise** — only one
+writer at a time across all processes.
+
+If a write call takes a beat longer than usual, that's a contending
+writer in another session. The server sets `PRAGMA busy_timeout =
+30000`, so SQLite politely waits up to 30 seconds for the lock
+before giving up. In practice, real contention resolves in
+milliseconds.
+
+If a tool call hangs for the full MCP transport timeout (~4 minutes)
+and returns "server may be unresponsive": that almost certainly
+**isn't** a crashed server — it's an unusually long write somewhere
+holding the lock past 30s, or a stuck transaction in another
+process. Restarting the offending client usually clears it. The
+substrate itself is fine.
 
 ---
 

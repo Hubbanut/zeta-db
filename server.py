@@ -73,7 +73,7 @@ INITIAL_CATEGORIES = [
     "other",
 ]
 
-TASK_STATUSES = {"open", "done", "blocked", "cancelled"}
+TASK_STATUSES = {"open", "in_progress", "blocked", "done", "cancelled"}
 
 # Conventional values for change_requests.request_type. Free-text at the
 # DB level, but instances should pick from this set so future AI instances have
@@ -155,6 +155,13 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    # CR #27 / #30: politely wait up to 30s for a contended write lock
+    # instead of failing immediately with SQLITE_BUSY (and being surfaced
+    # by the MCP transport as a 4-minute "server unresponsive" hang).
+    # 30s is well above any realistic concurrent-write duration in this
+    # workload; if a call ever waits longer than 30s, the resulting
+    # OperationalError will be a clearer signal than the silent hang.
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -239,7 +246,7 @@ def _init_schema() -> None:
                 body                  TEXT,
                 category_id           INTEGER NOT NULL REFERENCES categories(id),
                 status                TEXT NOT NULL DEFAULT 'open'
-                                          CHECK (status IN ('open', 'done', 'blocked', 'cancelled')),
+                                          CHECK (status IN ('open', 'in_progress', 'blocked', 'done', 'cancelled')),
                 importance            INTEGER NOT NULL DEFAULT 3
                                           CHECK (importance BETWEEN 1 AND 5),
                 due_date              TEXT,
@@ -433,14 +440,78 @@ def _init_schema() -> None:
             "WHERE field_changed = 'richards_remark'"
         )
 
+        # Migration 2026-06-01: widen tasks.status enum to include
+        # 'in_progress' (CR #29). SQLite has no ALTER TABLE ALTER CHECK,
+        # so the only way to update the CHECK constraint is to rewrite
+        # the table. Detect by looking at the stored CREATE TABLE text
+        # in sqlite_master; if 'in_progress' isn't in it, do the rewrite.
+        tasks_def = cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone()
+        if tasks_def and "in_progress" not in (tasks_def[0] or ""):
+            # FKs off for the dance: task_tags has FK to tasks(id) and
+            # we don't want CASCADE-deletes triggered by DROP TABLE.
+            cur.execute("PRAGMA foreign_keys = OFF")
+            try:
+                cur.execute(
+                    """
+                    CREATE TABLE tasks_new (
+                        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                        summary               TEXT NOT NULL,
+                        body                  TEXT,
+                        category_id           INTEGER NOT NULL REFERENCES categories(id),
+                        status                TEXT NOT NULL DEFAULT 'open'
+                                                  CHECK (status IN ('open', 'in_progress', 'blocked', 'done', 'cancelled')),
+                        importance            INTEGER NOT NULL DEFAULT 3
+                                                  CHECK (importance BETWEEN 1 AND 5),
+                        due_date              TEXT,
+                        requested_by_human    INTEGER NOT NULL DEFAULT 0
+                                                  CHECK (requested_by_human IN (0, 1)),
+                        human_remark          TEXT,
+                        nickname              TEXT,
+                        session_id            INTEGER REFERENCES sessions(id),
+                        created_at            TEXT NOT NULL,
+                        updated_at            TEXT NOT NULL,
+                        completed_at          TEXT
+                    )
+                    """
+                )
+                cur.execute(
+                    "INSERT INTO tasks_new "
+                    "(id, summary, body, category_id, status, importance, due_date, "
+                    "requested_by_human, human_remark, nickname, session_id, "
+                    "created_at, updated_at, completed_at) "
+                    "SELECT id, summary, body, category_id, status, importance, due_date, "
+                    "requested_by_human, human_remark, nickname, session_id, "
+                    "created_at, updated_at, completed_at FROM tasks"
+                )
+                cur.execute("DROP TABLE tasks")
+                cur.execute("ALTER TABLE tasks_new RENAME TO tasks")
+                # Indexes attached to the old table were dropped with it.
+                # The CREATE INDEX IF NOT EXISTS calls below recreate them
+                # with the current (post-rename) definitions.
+            finally:
+                cur.execute("PRAGMA foreign_keys = ON")
+
+        # Belt-and-braces: if the table didn't need a rewrite but the
+        # partial-unique index still has the old WHERE clause (no
+        # in_progress), drop it so the CREATE INDEX IF NOT EXISTS below
+        # rebuilds it with the new clause.
+        idx_def = cur.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' AND name='idx_tasks_nickname_active'"
+        ).fetchone()
+        if idx_def and "in_progress" not in (idx_def[0] or ""):
+            cur.execute("DROP INDEX idx_tasks_nickname_active")
+
         # Partial unique index: a nickname can only be reused once a task
-        # has left an "active" status (open/blocked). Completed and
-        # cancelled tasks free up their nickname for future reuse.
+        # has left an "active" status (open/in_progress/blocked). Completed
+        # and cancelled tasks free up their nickname for future reuse.
         cur.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_nickname_active
             ON tasks(nickname)
-            WHERE nickname IS NOT NULL AND status IN ('open', 'blocked')
+            WHERE nickname IS NOT NULL AND status IN ('open', 'in_progress', 'blocked')
             """
         )
         # Memories have no uniqueness constraint on nickname — they're a
@@ -1556,7 +1627,7 @@ def update_task(
 
     `nickname`: omit to leave alone, pass valid string to set, pass empty
     string ("") to clear. Setting a nickname that collides with another
-    open/blocked task returns an error. Reopening a task whose old
+    open / in_progress / blocked task returns an error. Reopening a task whose old
     nickname has since been taken also returns an error — clear the
     nickname or pick a different one.
 
@@ -1708,7 +1779,7 @@ def list_tasks(
 
     Args:
         category: Filter by category.
-        status: One of 'open', 'done', 'blocked', 'cancelled', or None for all.
+        status: One of 'open', 'in_progress', 'blocked', 'done', 'cancelled', or None for all.
         tags: ANY-match tag filter.
         due_before: ISO-8601 string; only tasks with due_date < this.
         limit: Max rows, default 20, hard cap 200.
@@ -1797,7 +1868,7 @@ def search_tasks(
     Args:
         query: Search string (matched as %query%, also against nickname).
         category: Optional category filter.
-        status: One of 'open', 'done', 'blocked', 'cancelled', or None for all.
+        status: One of 'open', 'in_progress', 'blocked', 'done', 'cancelled', or None for all.
             Defaults to 'open'.
         tags: ANY-match tag filter.
         limit: Default 10, hard-capped at SEARCH_HARD_LIMIT.

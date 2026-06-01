@@ -294,6 +294,20 @@ reopen = update_task(TID, status="open")
 check("update_task reopen clears completed_at",
       reopen.get("status") == "open" and reopen.get("completed_at") is None)
 
+# CR #29: in_progress status — set when actively working on a task.
+in_prog = update_task(TID, status="in_progress", session_id=SID)
+check("update_task accepts status='in_progress'", in_prog.get("status") == "in_progress")
+check("status='in_progress' does NOT stamp completed_at",
+      in_prog.get("completed_at") is None)
+# in_progress is an "active" status — nickname collision should still apply.
+update_task(TID, nickname="ACTIVE", session_id=SID)
+collide_in_prog = add_task(summary="conflict", category="work",
+                           nickname="ACTIVE", session_id=SID)
+check("nickname collides while another task is in_progress",
+      "error" in collide_in_prog and "already used" in collide_in_prog["error"].lower())
+# Move back to open for the rest of the suite.
+update_task(TID, status="open", nickname="", session_id=SID)
+
 # due_before
 add_task(summary="Overdue", category="work", due_date="2026-01-01", session_id=SID)
 add_task(summary="Future", category="work", due_date="2027-01-01", session_id=SID)
