@@ -125,17 +125,32 @@ check("add_memory rejects unknown category", "error" in bad)
 
 long_summary = "x" * 500
 bad = add_memory(summary=long_summary, category="work")
-check("add_memory rejects oversize summary", "error" in bad)
-# CR #22: error message includes the measured length now.
+check("add_memory rejects oversize summary (> 400 hard cap)", "error" in bad)
+# CR #22 / current spec: error message includes the measured length.
 check("oversize summary error includes measured length",
       "error" in bad and "500" in bad["error"],
       bad.get("error", ""))
 
-# CR #22: limit was bumped to 300; a 290-char summary should be accepted.
-ok_mid = add_memory(summary="x" * 290, category="work", session_id=SID)
-check("add_memory accepts ~290-char summary (limit bumped to 300)",
-      "error" not in ok_mid)
-delete_memory(ok_mid["id"], session_id=SID)
+# Target is 250, hard cap is 400 — a 380-char summary is over target
+# but under the hard cap, and should be accepted silently.
+over_target = add_memory(summary="x" * 380, category="work", session_id=SID)
+check("add_memory accepts 380-char summary (over target, under cap)",
+      "error" not in over_target)
+# Response surfaces the actual length so the caller can self-calibrate.
+check("add_memory response includes summary_length",
+      over_target.get("summary_length") == 380)
+delete_memory(over_target["id"], session_id=SID)
+
+# At the boundary: 400 chars exactly should still be accepted.
+at_cap = add_memory(summary="x" * 400, category="work", session_id=SID)
+check("add_memory accepts 400-char summary (at hard cap)",
+      "error" not in at_cap)
+delete_memory(at_cap["id"], session_id=SID)
+
+# 401 chars: rejected.
+just_over = add_memory(summary="x" * 401, category="work", session_id=SID)
+check("add_memory rejects 401-char summary (one over hard cap)",
+      "error" in just_over)
 
 # Origin field (CR #14)
 om = add_memory(summary="origin field test memory", category="work",
@@ -152,6 +167,75 @@ check("update_memory changes origin",
 update_memory(om["id"], origin="", session_id=SID)
 check("update_memory clears origin via empty string",
       get_memory(om["id"]).get("origin") is None)
+
+
+# --------------------------------------------------------------------
+section("CR #11 server-side salvage of leaked <parameter> XML in body")
+
+# A body that ends with leaked <parameter ...> blocks should be cleaned,
+# and the leaked params should be applied to the call.
+leaked_body = (
+    "Real body content goes here.\n"
+    '<parameter name="tags">["salvaged", "from-body"]\n'
+    '<parameter name="importance">5\n'
+    '<parameter name="session_id">' + SID
+)
+salvage_m = add_memory(
+    summary="Test salvage of leaked params",
+    category="work",
+    body=leaked_body,
+)
+check("salvage: add_memory accepts leaked body without erroring",
+      "error" not in salvage_m)
+check("salvage: recovered_from_body reports what was extracted",
+      "recovered_from_body" in salvage_m
+      and "tags" in salvage_m["recovered_from_body"]
+      and "importance" in salvage_m["recovered_from_body"])
+
+# Fetched memory should have clean body + salvaged params applied.
+salvaged_view = get_memory(salvage_m["id"])
+check("salvage: stored body has no leaked XML",
+      "<parameter" not in (salvaged_view.get("body") or ""))
+check("salvage: stored body retains the real content",
+      "Real body content" in (salvaged_view.get("body") or ""))
+check("salvage: tags applied from salvaged extraction",
+      set(salvaged_view.get("tags", [])) == {"salvaged", "from-body"})
+check("salvage: importance applied from salvaged extraction",
+      salvaged_view.get("importance") == 5)
+
+# Explicit kwarg takes precedence over salvage.
+salvage_m2 = add_memory(
+    summary="Salvage with explicit tags wins",
+    category="work",
+    body=leaked_body,
+    tags=["explicit"],  # explicit non-None — should win over salvaged
+)
+v2 = get_memory(salvage_m2["id"])
+check("salvage: explicit tags win over salvaged",
+      v2.get("tags") == ["explicit"])
+
+# A body that mid-references <parameter (e.g. documentation) should NOT
+# trigger salvage. Only trailing contiguous matches qualify.
+doc_body = (
+    'When documenting the gotcha, an example: <parameter name="tags">["x"]\n'
+    "Note that this is mid-body and not a real leak; trailing prose follows."
+)
+doc_m = add_memory(
+    summary="Doc-style body should not trigger salvage",
+    category="work",
+    body=doc_body,
+    tags=["explicit-doc"],
+)
+check("salvage: mid-body <parameter mention does NOT trigger salvage",
+      "recovered_from_body" not in doc_m)
+doc_view = get_memory(doc_m["id"])
+check("salvage: doc body preserved untouched",
+      "trailing prose follows" in (doc_view.get("body") or ""))
+
+# Cleanup the salvage test rows.
+delete_memory(salvage_m["id"])
+delete_memory(salvage_m2["id"])
+delete_memory(doc_m["id"])
 
 
 # --------------------------------------------------------------------

@@ -59,7 +59,13 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 
 DB_PATH = Path(_env("ZETA_DB_PATH") or (Path(__file__).parent / "memories.db"))
-SUMMARY_MAX_LEN = int(_env("ZETA_SUMMARY_MAX_LEN", "300") or "300")
+# Summary length: aim for SUMMARY_TARGET (250 chars) for a tight one-liner,
+# accept up to SUMMARY_MAX_LEN (400) before rejecting. Docstrings advertise
+# the target so AIs aim there; the wider hard cap means a slight overshoot
+# doesn't trigger an expensive resubmit. Every add/update return includes
+# `summary_length` so the caller can self-calibrate without server help.
+SUMMARY_TARGET = int(_env("ZETA_SUMMARY_TARGET", "250") or "250")
+SUMMARY_MAX_LEN = int(_env("ZETA_SUMMARY_MAX_LEN", "400") or "400")
 LIST_HARD_LIMIT = int(_env("ZETA_LIST_HARD_LIMIT", "200") or "200")
 SEARCH_HARD_LIMIT = int(_env("ZETA_SEARCH_HARD_LIMIT", "100") or "100")
 
@@ -668,8 +674,12 @@ def _validate_summary(summary: str) -> str | None:
         return "summary is required"
     if len(s) > SUMMARY_MAX_LEN:
         # Include the measured length so the caller can trim once, precisely
-        # (CR #22 — was previously a guessing loop).
-        return f"summary too long ({len(s)} chars > {SUMMARY_MAX_LEN})"
+        # (CR #22 — was previously a guessing loop). Hard cap is the wider
+        # SUMMARY_MAX_LEN; the SUMMARY_TARGET is the polite ask.
+        return (
+            f"summary too long ({len(s)} chars > hard cap {SUMMARY_MAX_LEN}; "
+            f"aim for <= {SUMMARY_TARGET})"
+        )
     return None
 
 
@@ -677,6 +687,135 @@ def _validate_importance(importance: int) -> str | None:
     if not isinstance(importance, int) or importance < 1 or importance > 5:
         return "importance must be an integer 1-5"
     return None
+
+
+# --------------------------------------------------------------------------
+# Tag-leak salvage (CR #11 server-side mitigation)
+#
+# When the XML-style tool-call serialiser fails to close a long-text
+# parameter cleanly, the following <parameter name="X">value</parameter>
+# elements get absorbed verbatim into the end of that long-text param
+# (typically body / description / notes). The caller's actual intent
+# (set tags, set session_id, etc.) is then silently lost.
+#
+# This helper detects the trailing <parameter ...> run and salvages the
+# values. Conservative: only acts on contiguous trailing matches that
+# reach (within whitespace) the end of the string, so mid-body
+# discussion of the tool-calling syntax isn't accidentally stripped.
+# --------------------------------------------------------------------------
+
+_LEAK_OPEN_RE = re.compile(r'<parameter\s+name="([^"]+)">', re.DOTALL)
+_LEAK_VALUE_END_RE = re.compile(r'\s*</parameter>\s*$', re.DOTALL)
+
+
+def _parse_salvaged_value(raw: str) -> Any:
+    """Best-effort: parse JSON if it looks like JSON, fall back to string."""
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s:
+        return s
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return s
+
+
+def _validate_salvaged_dict(d: dict[str, Any]) -> bool:
+    """Per-key type check on salvaged values. Return False (reject the whole
+    salvage) if any value doesn't look like a genuine kwarg — the alternative
+    is silently stripping body content from a doc-style mention of the
+    tool-calling syntax.
+    """
+    prose_re = re.compile(r"[.!?]\s+[A-Z]")
+    for k, v in d.items():
+        if k == "tags":
+            if not (isinstance(v, list) and all(isinstance(t, str) for t in v)):
+                return False
+        elif k == "importance":
+            if not (isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 5):
+                return False
+        elif k == "requested_by_human":
+            if not isinstance(v, bool):
+                return False
+        elif k == "nickname":
+            if not (isinstance(v, str) and _NICKNAME_RE.match(v)):
+                return False
+        elif k == "session_id":
+            if not (isinstance(v, str) and re.match(r"^[a-f0-9]{8,32}$", v)):
+                return False
+        elif k in ("human_remark", "origin", "category"):
+            if not isinstance(v, str):
+                return False
+            # Reject anything that smells like prose — multi-sentence text
+            # is a strong signal we caught mid-body documentation, not a
+            # genuine kwarg value.
+            if len(v) > 200 or len(prose_re.findall(v)) >= 2:
+                return False
+        # Unknown keys: accept silently (forward-compat with future kwargs).
+    return True
+
+
+def _salvage_leaked_params(text: str | None) -> tuple[str | None, dict[str, Any]]:
+    """Detect trailing <parameter name="X">value</?> fragments absorbed into
+    a long-text param and return (cleaned_text, {name: parsed_value}).
+
+    Returns ``(text, {})`` unchanged if no leak detected. Only salvages a
+    contiguous run of leaked params at the very end of the text — a single
+    mid-body mention of `<parameter` is left untouched.
+    """
+    if not text or '<parameter' not in text:
+        return text, {}
+
+    matches = list(_LEAK_OPEN_RE.finditer(text))
+    if not matches:
+        return text, {}
+
+    # Only consider this a leak if the last <parameter ...> opening is at
+    # (or near) the end of the text — within trailing-whitespace tolerance.
+    # If there's significant non-XML body after the last open tag, this is
+    # mid-body documentation, not a leak. (We accept </parameter> + whitespace
+    # as "near the end".)
+    tail_after_last_open = text[matches[-1].end():]
+    tail_stripped = _LEAK_VALUE_END_RE.sub("", tail_after_last_open).strip()
+    # If what remains after the last open tag still contains another
+    # <parameter or any non-trivial content beyond the value itself, bail.
+    # The value can be arbitrary, so we don't validate its content — we
+    # just require no further markup after it.
+    if '<parameter' in tail_stripped or '</parameter>' in tail_stripped:
+        return text, {}
+
+    # Walk backward through the matches collecting the contiguous leaked
+    # run. A pair of adjacent matches is "contiguous" when the gap between
+    # them (the previous value plus any close tag) has no body content
+    # beyond the value text itself — which is, by definition, the previous
+    # leak's value. So contiguity is automatic: every <parameter ...>
+    # match starts a new leak segment.
+    extracted: dict[str, Any] = {}
+    leak_start = matches[-1].start()
+    for i, m in enumerate(matches):
+        # Value runs from this match.end() to the next match.start(), or
+        # to end-of-text if this is the last.
+        if i + 1 < len(matches):
+            value_end = matches[i + 1].start()
+        else:
+            value_end = len(text)
+        raw_value = text[m.end():value_end]
+        # Strip trailing </parameter> + whitespace if present.
+        raw_value = _LEAK_VALUE_END_RE.sub("", raw_value)
+        extracted[m.group(1)] = _parse_salvaged_value(raw_value)
+        leak_start = min(leak_start, m.start())
+
+    # Final guard: every extracted value must validate as a genuine kwarg.
+    # If any fails (typical case: caught a mid-body documentation mention
+    # rather than a real trailing leak), bail the whole salvage so the
+    # caller's body is preserved untouched.
+    if not _validate_salvaged_dict(extracted):
+        return text, {}
+
+    # Cleaned text = everything up to the leak start (rstripped).
+    cleaned = text[:leak_start].rstrip() or None
+    return cleaned, extracted
 
 
 def _clean_nickname(nick: str | None) -> tuple[str | None, str | None]:
@@ -1127,8 +1266,11 @@ def add_memory(
     """Insert a new memory.
 
     Args:
-        summary: Short form (required, <= ~300 chars). Error message
-            includes the measured length if rejected.
+        summary: Short form (required). Aim for ≤ 250 chars; hard cap
+            is 400. Going over 250 is silently accepted, but the response
+            includes `summary_length` so you can self-calibrate without
+            being rejected. Past the 400 hard cap the error message
+            includes the measured length, so you can trim once precisely.
         category: Must already exist (call list_categories / add_category first).
         body: Optional long-form content. Use when there's context,
             background, sub-steps, or links to capture beyond the summary
@@ -1152,6 +1294,35 @@ def add_memory(
             for conventions. Leave null when there's no obvious thread.
         session_id: From register_session(). Omit for anonymous.
     """
+    # CR #11 mitigation: if the body contains trailing leaked
+    # <parameter ...> XML, salvage values and clean the body. Salvaged
+    # values only fill in kwargs the caller left at their default — an
+    # explicit non-default kwarg always wins.
+    recovered: dict[str, Any] = {}
+    if body:
+        cleaned_body, salvaged = _salvage_leaked_params(body)
+        if salvaged:
+            body = cleaned_body
+            if salvaged.get("tags") is not None and tags is None:
+                tags = salvaged["tags"]; recovered["tags"] = tags
+            if salvaged.get("importance") is not None and importance == 3:
+                try:
+                    importance = int(salvaged["importance"])
+                    recovered["importance"] = importance
+                except (TypeError, ValueError):
+                    pass
+            if salvaged.get("requested_by_human") is not None and requested_by_human is False:
+                requested_by_human = bool(salvaged["requested_by_human"])
+                recovered["requested_by_human"] = requested_by_human
+            if salvaged.get("human_remark") is not None and human_remark is None:
+                human_remark = salvaged["human_remark"]; recovered["human_remark"] = human_remark
+            if salvaged.get("nickname") is not None and nickname is None:
+                nickname = salvaged["nickname"]; recovered["nickname"] = nickname
+            if salvaged.get("origin") is not None and origin is None:
+                origin = salvaged["origin"]; recovered["origin"] = origin
+            if salvaged.get("session_id") is not None and session_id is None:
+                session_id = salvaged["session_id"]; recovered["session_id"] = session_id
+
     if (err := _validate_summary(summary)):
         return {"error": err}
     if (err := _validate_importance(importance)):
@@ -1206,7 +1377,15 @@ def add_memory(
             "tags": sorted({t.strip().lower() for t in (tags or []) if t.strip()}),
         }, session_pk)
 
-        return {"id": memory_id, "nickname": cleaned_nick, "created_at": now}
+        out = {
+            "id": memory_id,
+            "nickname": cleaned_nick,
+            "created_at": now,
+            "summary_length": len(summary.strip()),
+        }
+        if recovered:
+            out["recovered_from_body"] = recovered
+        return out
     finally:
         conn.close()
 
@@ -1518,8 +1697,11 @@ def add_task(
     """Insert a new task. Status defaults to 'open'.
 
     Args:
-        summary: Short form (required, <= ~300 chars). Error message
-            includes the measured length if rejected.
+        summary: Short form (required). Aim for ≤ 250 chars; hard cap
+            is 400. Going over 250 is silently accepted, but the response
+            includes `summary_length` so you can self-calibrate without
+            being rejected. Past the 400 hard cap the error message
+            includes the measured length, so you can trim once precisely.
         category: Must already exist.
         body: Optional long-form detail. Use when there's context,
             sub-steps, background, or links to capture. If
@@ -1540,6 +1722,30 @@ def add_task(
             otherwise.
         session_id: From register_session().
     """
+    # CR #11 mitigation: salvage trailing leaked <parameter ...> from body.
+    recovered: dict[str, Any] = {}
+    if body:
+        cleaned_body, salvaged = _salvage_leaked_params(body)
+        if salvaged:
+            body = cleaned_body
+            if salvaged.get("tags") is not None and tags is None:
+                tags = salvaged["tags"]; recovered["tags"] = tags
+            if salvaged.get("importance") is not None and importance == 3:
+                try:
+                    importance = int(salvaged["importance"])
+                    recovered["importance"] = importance
+                except (TypeError, ValueError):
+                    pass
+            if salvaged.get("requested_by_human") is not None and requested_by_human is False:
+                requested_by_human = bool(salvaged["requested_by_human"])
+                recovered["requested_by_human"] = requested_by_human
+            if salvaged.get("human_remark") is not None and human_remark is None:
+                human_remark = salvaged["human_remark"]; recovered["human_remark"] = human_remark
+            if salvaged.get("nickname") is not None and nickname is None:
+                nickname = salvaged["nickname"]; recovered["nickname"] = nickname
+            if salvaged.get("session_id") is not None and session_id is None:
+                session_id = salvaged["session_id"]; recovered["session_id"] = session_id
+
     if (err := _validate_summary(summary)):
         return {"error": err}
     if (err := _validate_importance(importance)):
@@ -1600,7 +1806,15 @@ def add_task(
             "tags": sorted({t.strip().lower() for t in (tags or []) if t.strip()}),
         }, session_pk)
 
-        return {"id": task_id, "nickname": cleaned_nick, "created_at": now}
+        out = {
+            "id": task_id,
+            "nickname": cleaned_nick,
+            "created_at": now,
+            "summary_length": len(summary.strip()),
+        }
+        if recovered:
+            out["recovered_from_body"] = recovered
+        return out
     finally:
         conn.close()
 
@@ -2138,6 +2352,15 @@ def request_changes(
     if not request_type.strip() or not target.strip() or not description.strip():
         return {"error": "request_type, target, and description are all required"}
 
+    # CR #11 mitigation: salvage trailing leaked <parameter ...> from description.
+    recovered: dict[str, Any] = {}
+    if description:
+        cleaned_desc, salvaged = _salvage_leaked_params(description)
+        if salvaged:
+            description = cleaned_desc or ""
+            if salvaged.get("session_id") is not None and session_id is None:
+                session_id = salvaged["session_id"]; recovered["session_id"] = session_id
+
     conn = _connect()
     try:
         session_pk = _resolve_session(conn, session_id)
@@ -2150,7 +2373,10 @@ def request_changes(
             """,
             (request_type.strip(), target.strip(), description.strip(), session_pk, now),
         )
-        return {"id": cur.lastrowid, "status": "open", "created_at": now}
+        out = {"id": cur.lastrowid, "status": "open", "created_at": now}
+        if recovered:
+            out["recovered_from_body"] = recovered
+        return out
     finally:
         conn.close()
 
@@ -2263,6 +2489,17 @@ def add_chat(
         session_id: From register_session(). Don't omit — anonymous chat
             messages defeat the point of inter-instance attribution.
     """
+    # CR #11 mitigation: salvage trailing leaked <parameter ...> from body.
+    recovered: dict[str, Any] = {}
+    if body:
+        cleaned_body, salvaged = _salvage_leaked_params(body)
+        if salvaged:
+            body = cleaned_body or ""
+            if salvaged.get("tags") is not None and tags is None:
+                tags = salvaged["tags"]; recovered["tags"] = tags
+            if salvaged.get("session_id") is not None and session_id is None:
+                session_id = salvaged["session_id"]; recovered["session_id"] = session_id
+
     if not body or not body.strip():
         return {"error": "body is required"}
     channel = (channel or "general").strip().lower()
@@ -2306,12 +2543,15 @@ def add_chat(
         if author_nickname:
             _auto_subscribe_for_persona(conn, author_nickname)
 
-        return {
+        out = {
             "id": chat_id,
             "channel": channel,
             "author_nickname": author_nickname,
             "created_at": now,
         }
+        if recovered:
+            out["recovered_from_body"] = recovered
+        return out
     finally:
         conn.close()
 
@@ -2519,6 +2759,17 @@ def add_journal_entry(
         tags: Optional tags.
         session_id: From register_session().
     """
+    # CR #11 mitigation: salvage trailing leaked <parameter ...> from notes.
+    recovered: dict[str, Any] = {}
+    if notes:
+        cleaned_notes, salvaged = _salvage_leaked_params(notes)
+        if salvaged:
+            notes = cleaned_notes
+            if salvaged.get("tags") is not None and tags is None:
+                tags = salvaged["tags"]; recovered["tags"] = tags
+            if salvaged.get("session_id") is not None and session_id is None:
+                session_id = salvaged["session_id"]; recovered["session_id"] = session_id
+
     if not entry_type or not entry_type.strip():
         return {"error": "entry_type is required"}
     et = entry_type.strip().lower()
@@ -2549,12 +2800,15 @@ def add_journal_entry(
             "tags": sorted({t.strip().lower() for t in (tags or []) if t.strip()}),
         }, session_pk)
 
-        return {
+        out = {
             "id": entry_id,
             "entry_type": et,
             "timestamp": ts,
             "created_at": now,
         }
+        if recovered:
+            out["recovered_from_body"] = recovered
+        return out
     finally:
         conn.close()
 

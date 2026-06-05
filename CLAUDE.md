@@ -802,7 +802,8 @@ It uses `memories.smoketest.db` (gitignored) and never touches the real
 `.env` keys (all optional, defaults shown in `.env.example`):
 
 - `ZETA_DB_PATH` — path to the SQLite file. Default: `./memories.db`.
-- `ZETA_SUMMARY_MAX_LEN=300`
+- `ZETA_SUMMARY_TARGET=250` — advertised in docstrings; aim point
+- `ZETA_SUMMARY_MAX_LEN=400` — hard cap; rejection only past this
 - `ZETA_LIST_HARD_LIMIT=200`
 - `ZETA_SEARCH_HARD_LIMIT=100`
 
