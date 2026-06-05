@@ -66,6 +66,14 @@ DB_PATH = Path(_env("ZETA_DB_PATH") or (Path(__file__).parent / "memories.db"))
 # `summary_length` so the caller can self-calibrate without server help.
 SUMMARY_TARGET = int(_env("ZETA_SUMMARY_TARGET", "250") or "250")
 SUMMARY_MAX_LEN = int(_env("ZETA_SUMMARY_MAX_LEN", "400") or "400")
+
+# Embedding backend (CR #16). Default 'none' means no embeddings are
+# computed and semantic_search_memories is a no-op. Switch to 'openai'
+# to enable embed-on-write. Future backends could be added: 'voyage',
+# 'google', 'local' (sentence-transformers).
+EMBED_BACKEND = (_env("ZETA_EMBED_BACKEND") or "none").lower()
+EMBED_MODEL = _env("ZETA_EMBED_MODEL") or "text-embedding-3-large"
+EMBED_DIMS = int(_env("ZETA_EMBED_DIMS") or "1024")
 LIST_HARD_LIMIT = int(_env("ZETA_LIST_HARD_LIMIT", "200") or "200")
 SEARCH_HARD_LIMIT = int(_env("ZETA_SEARCH_HARD_LIMIT", "100") or "100")
 
@@ -168,6 +176,19 @@ def _connect() -> sqlite3.Connection:
     # workload; if a call ever waits longer than 30s, the resulting
     # OperationalError will be a clearer signal than the silent hang.
     conn.execute("PRAGMA busy_timeout = 30000")
+    # CR #16: load sqlite-vec extension for vector similarity functions
+    # (vec_distance_cosine etc.). Only attempted when embeddings are
+    # enabled — keeps the no-embedding path zero-dependency at runtime.
+    if EMBED_BACKEND != "none":
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except (ImportError, AttributeError, sqlite3.OperationalError):
+            # extension not installed / not loadable on this Python build;
+            # semantic search will fail gracefully when called.
+            pass
     return conn
 
 
@@ -237,7 +258,8 @@ def _init_schema() -> None:
                 session_id            INTEGER REFERENCES sessions(id),
                 created_at            TEXT NOT NULL,
                 updated_at            TEXT NOT NULL,
-                last_accessed         TEXT NOT NULL
+                last_accessed         TEXT NOT NULL,
+                embedding             BLOB  -- CR #16: float32 vector
             );
 
             CREATE TABLE IF NOT EXISTS memory_tags (
@@ -415,6 +437,13 @@ def _init_schema() -> None:
         # Migration 2026-05-22: origin column on memories (CR #14).
         if not _has_column("memories", "origin"):
             cur.execute("ALTER TABLE memories ADD COLUMN origin TEXT")
+
+        # Migration 2026-06-05: embedding column on memories (CR #16).
+        # Stored as raw float32 BLOB so sqlite-vec functions can operate
+        # on it directly. NULL means "not yet embedded" — backfill via
+        # backfill_embeddings().
+        if not _has_column("memories", "embedding"):
+            cur.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
 
         # Migration 2026-05-28: rename the project-maintainer-specific
         # field names to generic ones describing the human collaborator.
@@ -608,6 +637,11 @@ def _hydrate_memory(conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool) -
     d["category"] = _category_name(conn, d.pop("category_id"))
     d["requested_by_human"] = bool(d["requested_by_human"])
     d["tags"] = _get_tags(conn, "memory_tags", "memory_id", d["id"])
+    # The embedding BLOB is ~4 KB and useless to API callers — drop it
+    # but surface a presence indicator so the caller can tell whether
+    # the row has been embedded.
+    embed = d.pop("embedding", None)
+    d["has_embedding"] = embed is not None
     # nickname and origin stay in both full and summary views — both
     # are scan-time identifiers.
     if not full:
@@ -816,6 +850,104 @@ def _salvage_leaked_params(text: str | None) -> tuple[str | None, dict[str, Any]
     # Cleaned text = everything up to the leak start (rstripped).
     cleaned = text[:leak_start].rstrip() or None
     return cleaned, extracted
+
+
+# --------------------------------------------------------------------------
+# Embedding backend (CR #16)
+#
+# Configured via ZETA_EMBED_BACKEND in .env. Default 'none' makes the
+# embed/semantic-search surface a no-op so the server runs without any
+# API key. Set to 'openai' to enable embed-on-write using
+# text-embedding-3-large at 1024 dimensions (Matryoshka-truncated for
+# storage + ANN-search efficiency).
+#
+# Vectors are stored as raw float32 BLOBs in memories.embedding so
+# sqlite-vec's vec_distance_cosine() can operate on them directly.
+# --------------------------------------------------------------------------
+
+_openai_client = None
+
+
+def _get_openai_client():
+    """Lazy-construct an OpenAI client. Reads the API key from
+    OPENAI_API_KEY first, then OPENAI_API_KEY_SIDE_PROJECTS_BRENT
+    (the maintainer's namespaced env var).
+    """
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+    try:
+        import openai
+    except ImportError as e:
+        raise RuntimeError(
+            "openai package not installed — pip install openai"
+        ) from e
+    api_key = (
+        _env("OPENAI_API_KEY")
+        or _env("OPENAI_API_KEY_SIDE_PROJECTS_BRENT")
+    )
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY not set in .env (or OPENAI_API_KEY_SIDE_PROJECTS_BRENT)"
+        )
+    _openai_client = openai.OpenAI(api_key=api_key)
+    return _openai_client
+
+
+def _vec_to_blob(vec: list[float]) -> bytes:
+    """Pack a list of floats as a little-endian float32 BLOB for sqlite-vec."""
+    import struct
+    return struct.pack(f"<{len(vec)}f", *vec)
+
+
+def _embed_text(text: str | None) -> bytes | None:
+    """Embed text to a BLOB vector via the configured backend.
+
+    Returns None if backend='none' or text is empty/whitespace-only.
+    Raises RuntimeError for configuration errors (no API key, unknown
+    backend) so callers can decide whether to surface or swallow.
+    """
+    if EMBED_BACKEND == "none":
+        return None
+    if not text or not text.strip():
+        return None
+    if EMBED_BACKEND == "openai":
+        client = _get_openai_client()
+        resp = client.embeddings.create(
+            model=EMBED_MODEL,
+            input=text.strip(),
+            dimensions=EMBED_DIMS,
+        )
+        return _vec_to_blob(resp.data[0].embedding)
+    raise RuntimeError(
+        f"unknown ZETA_EMBED_BACKEND='{EMBED_BACKEND}'; "
+        "supported: none, openai"
+    )
+
+
+def _memory_embed_text(summary: str | None, body: str | None) -> str:
+    """The text we send to the embedding model for a memory: summary +
+    body joined. Summary alone is too thin for good retrieval; body
+    alone misses the headline.
+    """
+    parts = []
+    if summary and summary.strip():
+        parts.append(summary.strip())
+    if body and body.strip():
+        parts.append(body.strip())
+    return "\n\n".join(parts)
+
+
+def _try_embed_memory(summary: str | None, body: str | None) -> bytes | None:
+    """Best-effort embedding for a memory write. Returns None on any
+    failure (backend='none', no API key, network blip) — the memory
+    write itself should never fail because the embedding step failed.
+    Backfill via backfill_embeddings() can fill in NULL rows later.
+    """
+    try:
+        return _embed_text(_memory_embed_text(summary, body))
+    except Exception:
+        return None
 
 
 def _clean_nickname(nick: str | None) -> tuple[str | None, str | None]:
@@ -1364,6 +1496,16 @@ def add_memory(
         memory_id = cur.lastrowid
         _set_tags(conn, "memory_tags", "memory_id", memory_id, tags or [])
 
+        # CR #16: embed on write. Best-effort — if the embed backend is
+        # off / misconfigured / unreachable, the memory is still saved
+        # and can be embedded later via backfill_embeddings().
+        embed_blob = _try_embed_memory(summary.strip(), body)
+        if embed_blob is not None:
+            conn.execute(
+                "UPDATE memories SET embedding = ? WHERE id = ?",
+                (embed_blob, memory_id),
+            )
+
         # CR #20 audit
         _audit_create(conn, "memory", memory_id, {
             "summary": summary.strip(),
@@ -1498,6 +1640,22 @@ def update_memory(
         if tags is not None:
             _set_tags(conn, "memory_tags", "memory_id", id, tags)
             _audit_tag_change(conn, "memory", id, old_tags, tags, session_pk)
+
+        # CR #16: re-embed when summary or body changed (the two fields the
+        # embedding is derived from). Best-effort: a failure here just
+        # leaves the previous embedding in place — better stale than nothing,
+        # and a backfill pass can refresh later if needed.
+        changed_fields = {field for field, _, _ in audit_changes}
+        if changed_fields & {"summary", "body"}:
+            current = conn.execute(
+                "SELECT summary, body FROM memories WHERE id = ?", (id,)
+            ).fetchone()
+            embed_blob = _try_embed_memory(current["summary"], current["body"])
+            if embed_blob is not None:
+                conn.execute(
+                    "UPDATE memories SET embedding = ? WHERE id = ?",
+                    (embed_blob, id),
+                )
 
         row = conn.execute("SELECT * FROM memories WHERE id = ?", (id,)).fetchone()
         return _hydrate_memory(conn, row, full=True)
@@ -1674,6 +1832,466 @@ def get_memory(id: int) -> dict[str, Any]:
         return _hydrate_memory(conn, row, full=True)
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# Semantic search + hybrid search + backfill (CR #16 / CR #17)
+# --------------------------------------------------------------------------
+
+
+def _time_decay_factor(last_accessed: str | None, alpha: float) -> float:
+    """Anderson / ACT-R power-law decay: (1 + days_since_access)^(-alpha).
+
+    alpha=0   -> 1.0 (no decay)
+    alpha=0.5 -> gentle decay (1-week-old memory is 0.4x a 1-day-old one)
+    alpha=1.0 -> aggressive (10-day-old is 0.1x a 1-day-old)
+    """
+    if alpha <= 0 or not last_accessed:
+        return 1.0
+    try:
+        # last_accessed is stored as 'YYYY-MM-DD HH:MM:SS.ffffff' (UTC)
+        s = last_accessed.replace("Z", "")
+        if "." in s:
+            la = datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f")
+        else:
+            la = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        la = la.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age_days = max(0.0, (now - la).total_seconds() / 86400.0)
+        return (1.0 + age_days) ** (-alpha)
+    except (ValueError, TypeError):
+        return 1.0
+
+
+@mcp.tool()
+def backfill_embeddings(max_rows: int = 100) -> dict[str, Any]:
+    """Embed any memories with NULL embedding (CR #16).
+
+    Useful after first enabling ZETA_EMBED_BACKEND on an existing DB,
+    or after changing models (set EMBED_MODEL/EMBED_DIMS in .env, then
+    NULL out the old vectors and re-run).
+
+    Stops at max_rows per call to bound rate-limit and cost exposure;
+    re-run to continue. Aborts early after 3 consecutive errors.
+    """
+    if EMBED_BACKEND == "none":
+        return {"error": "ZETA_EMBED_BACKEND is 'none'; nothing to backfill"}
+    max_rows = max(1, min(max_rows, 1000))
+
+    conn = _connect()
+    scanned = embedded = skipped = errors = 0
+    error_messages: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT id, summary, body FROM memories "
+            "WHERE embedding IS NULL ORDER BY id LIMIT ?",
+            (max_rows,),
+        ).fetchall()
+        scanned = len(rows)
+        consecutive_errors = 0
+        for r in rows:
+            text = _memory_embed_text(r["summary"], r["body"])
+            if not text:
+                skipped += 1
+                continue
+            try:
+                blob = _embed_text(text)
+                if blob is None:
+                    skipped += 1
+                    consecutive_errors = 0
+                    continue
+                conn.execute(
+                    "UPDATE memories SET embedding = ? WHERE id = ?",
+                    (blob, r["id"]),
+                )
+                embedded += 1
+                consecutive_errors = 0
+            except Exception as e:
+                errors += 1
+                consecutive_errors += 1
+                if len(error_messages) < 5:
+                    error_messages.append(f"id={r['id']}: {e}")
+                if consecutive_errors >= 3:
+                    error_messages.append("aborted: 3 consecutive errors")
+                    break
+        # Estimate remaining count.
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NULL"
+        ).fetchone()[0]
+        return {
+            "scanned": scanned,
+            "embedded": embedded,
+            "skipped": skipped,
+            "errors": errors,
+            "error_messages": error_messages or None,
+            "remaining": remaining,
+        }
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def semantic_search_memories(
+    query: str,
+    top_k: int = 10,
+    min_similarity: float = 0.0,
+    category: str | None = None,
+    tags: list[str] | None = None,
+    decay_alpha: float = 0.0,
+) -> dict[str, Any]:
+    """Find memories semantically similar to the query (CR #16).
+
+    Args:
+        query: Free-text — embedded via the configured backend.
+        top_k: Max results (default 10, hard cap 100).
+        min_similarity: Filter out cosine similarities below this (0..1).
+        category: Optional category filter.
+        tags: Optional ANY-match tag filter.
+        decay_alpha: Time-decay aggressiveness (Anderson/ACT-R power-law).
+            0 = no decay (pure semantic), 0.5 = gentle, 1.0 = aggressive.
+            Final score = similarity * (1 + days_since_last_access)^(-alpha).
+    """
+    if EMBED_BACKEND == "none":
+        return {"error": "embeddings disabled; set ZETA_EMBED_BACKEND in .env"}
+    if not query or not query.strip():
+        return {"error": "query is required"}
+    top_k = max(1, min(top_k, 100))
+
+    try:
+        qvec = _embed_text(query)
+    except Exception as e:
+        return {"error": f"embedding query failed: {e}"}
+    if qvec is None:
+        return {"error": "no embedding produced for query"}
+
+    conn = _connect()
+    try:
+        wheres = ["m.embedding IS NOT NULL"]
+        params: list[Any] = [qvec]  # used in SELECT distance computation
+        if category:
+            cat_id = _resolve_category(conn, category.strip().lower())
+            if cat_id is None:
+                return {"error": f"unknown category '{category}'"}
+            wheres.append("m.category_id = ?")
+            params.append(cat_id)
+        if tags:
+            clean_tags = [t.strip().lower() for t in tags if t.strip()]
+            if clean_tags:
+                ph = ",".join("?" * len(clean_tags))
+                wheres.append(
+                    f"m.id IN (SELECT memory_id FROM memory_tags "
+                    f"WHERE tag_name IN ({ph}))"
+                )
+                params.extend(clean_tags)
+
+        where_clause = " AND ".join(wheres)
+        # Over-fetch by 3x so decay re-ranking doesn't push the right rows
+        # off the bottom of the SQL-side ordering.
+        over_fetch = top_k * 3
+        sql = (
+            "SELECT m.id, m.summary, m.body, m.category_id, m.importance, "
+            "m.nickname, m.origin, m.last_accessed, m.updated_at, "
+            "(1.0 - vec_distance_cosine(m.embedding, ?)) AS similarity "
+            f"FROM memories m WHERE {where_clause} "
+            "ORDER BY similarity DESC LIMIT ?"
+        )
+        params.append(over_fetch)
+        rows = conn.execute(sql, params).fetchall()
+
+        results = []
+        for r in rows:
+            sim = float(r["similarity"])
+            if sim < min_similarity:
+                continue
+            decay = _time_decay_factor(r["last_accessed"], decay_alpha)
+            score = sim * decay
+            results.append({
+                "id": r["id"],
+                "summary": r["summary"],
+                "category": _category_name(conn, r["category_id"]),
+                "importance": r["importance"],
+                "nickname": r["nickname"],
+                "origin": r["origin"],
+                "tags": _get_tags(conn, "memory_tags", "memory_id", r["id"]),
+                "similarity": round(sim, 4),
+                "decay_factor": round(decay, 4),
+                "score": round(score, 4),
+                "last_accessed": r["last_accessed"],
+            })
+
+        # Re-rank by decayed score and trim to top_k.
+        results.sort(key=lambda d: d["score"], reverse=True)
+        results = results[:top_k]
+        return {"query": query, "count": len(results), "results": results}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def hybrid_search_memories(
+    query: str,
+    like_text: str | None = None,
+    top_k: int = 10,
+    min_similarity: float = 0.0,
+    category: str | None = None,
+    tags: list[str] | None = None,
+    decay_alpha: float = 0.0,
+    match_mode: str = "any",
+) -> dict[str, Any]:
+    """Combine structural LIKE filters with semantic similarity (CR #17).
+
+    Realises the "WHERE field LIKE OR similarity > N" pattern in one query.
+
+    Args:
+        query: Semantic query — embedded.
+        like_text: Optional case-insensitive substring; if provided, applied
+            to both summary and body as LIKE '%text%'. Omit to skip the
+            structural filter (pure semantic).
+        match_mode: 'any' (default) returns rows matching EITHER the LIKE
+            OR semantic-similarity (similarity > min_similarity); 'all'
+            requires BOTH (memory must hit the LIKE *and* exceed
+            min_similarity).
+        top_k, min_similarity, category, tags, decay_alpha: see
+            semantic_search_memories.
+    """
+    if EMBED_BACKEND == "none":
+        return {"error": "embeddings disabled; set ZETA_EMBED_BACKEND in .env"}
+    if not query or not query.strip():
+        return {"error": "query is required"}
+    if match_mode not in ("any", "all"):
+        return {"error": "match_mode must be 'any' or 'all'"}
+    top_k = max(1, min(top_k, 100))
+
+    try:
+        qvec = _embed_text(query)
+    except Exception as e:
+        return {"error": f"embedding query failed: {e}"}
+    if qvec is None:
+        return {"error": "no embedding produced for query"}
+
+    conn = _connect()
+    try:
+        # Base filters (always applied): non-null embedding + category/tag.
+        base_wheres = ["m.embedding IS NOT NULL"]
+        base_params: list[Any] = []
+        if category:
+            cat_id = _resolve_category(conn, category.strip().lower())
+            if cat_id is None:
+                return {"error": f"unknown category '{category}'"}
+            base_wheres.append("m.category_id = ?")
+            base_params.append(cat_id)
+        if tags:
+            clean_tags = [t.strip().lower() for t in tags if t.strip()]
+            if clean_tags:
+                ph = ",".join("?" * len(clean_tags))
+                base_wheres.append(
+                    f"m.id IN (SELECT memory_id FROM memory_tags "
+                    f"WHERE tag_name IN ({ph}))"
+                )
+                base_params.extend(clean_tags)
+
+        # Hybrid filter: combine LIKE and similarity per match_mode.
+        like_clauses: list[str] = []
+        like_params: list[Any] = []
+        if like_text and like_text.strip():
+            pat = f"%{like_text.strip()}%"
+            like_clauses.append("(m.summary LIKE ? OR m.body LIKE ?)")
+            like_params.extend([pat, pat])
+        sim_clause = "(1.0 - vec_distance_cosine(m.embedding, ?)) > ?"
+
+        if not like_clauses:
+            # Pure semantic — fall through to similarity-only filter.
+            hybrid_wheres = [sim_clause]
+            hybrid_params: list[Any] = [qvec, min_similarity]
+        elif match_mode == "any":
+            hybrid_wheres = [f"({like_clauses[0]} OR {sim_clause})"]
+            hybrid_params = like_params + [qvec, min_similarity]
+        else:  # 'all'
+            hybrid_wheres = [like_clauses[0], sim_clause]
+            hybrid_params = like_params + [qvec, min_similarity]
+
+        all_wheres = base_wheres + hybrid_wheres
+        where_clause = " AND ".join(all_wheres)
+        over_fetch = top_k * 3
+        sql = (
+            "SELECT m.id, m.summary, m.body, m.category_id, m.importance, "
+            "m.nickname, m.origin, m.last_accessed, m.updated_at, "
+            "(1.0 - vec_distance_cosine(m.embedding, ?)) AS similarity "
+            f"FROM memories m WHERE {where_clause} "
+            "ORDER BY similarity DESC LIMIT ?"
+        )
+        # Parameter order: SELECT's qvec, then base_params, then hybrid_params,
+        # then over_fetch.
+        params = [qvec] + base_params + hybrid_params + [over_fetch]
+        rows = conn.execute(sql, params).fetchall()
+
+        results = []
+        for r in rows:
+            sim = float(r["similarity"])
+            decay = _time_decay_factor(r["last_accessed"], decay_alpha)
+            score = sim * decay
+            results.append({
+                "id": r["id"],
+                "summary": r["summary"],
+                "category": _category_name(conn, r["category_id"]),
+                "importance": r["importance"],
+                "nickname": r["nickname"],
+                "origin": r["origin"],
+                "tags": _get_tags(conn, "memory_tags", "memory_id", r["id"]),
+                "similarity": round(sim, 4),
+                "decay_factor": round(decay, 4),
+                "score": round(score, 4),
+                "matched_like": bool(like_text and like_text.strip()
+                                     and like_text.strip().lower() in
+                                     (r["summary"] or "").lower() + " " +
+                                     (r["body"] or "").lower()),
+                "last_accessed": r["last_accessed"],
+            })
+
+        results.sort(key=lambda d: d["score"], reverse=True)
+        results = results[:top_k]
+        return {
+            "query": query,
+            "like_text": like_text,
+            "match_mode": match_mode,
+            "count": len(results),
+            "results": results,
+        }
+    finally:
+        conn.close()
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using tiktoken if available, falling back to
+    chars/4 (a reasonable approximation for English-heavy prose).
+    """
+    if not text:
+        return 0
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")  # GPT-4 / Claude-ish
+        return len(enc.encode(text))
+    except (ImportError, Exception):
+        return max(1, len(text) // 4)
+
+
+@mcp.tool()
+def bulk_load_context(
+    query: str,
+    max_tokens: int = 50000,
+    min_similarity: float = 0.3,
+    category: str | None = None,
+    tags: list[str] | None = None,
+    decay_alpha: float = 0.3,
+    include_body: bool = True,
+) -> dict[str, Any]:
+    """Fetch the most-relevant memories for a role/topic prompt, ordered
+    and packed into a context-sparing format up to a token budget
+    (CR #17 — the bulk-pull half).
+
+    The intended use: a new AI session is given a role description as a
+    prompt; it calls this tool to load a coherent slice of the human's
+    durable memory store, returning text it can read directly.
+
+    Args:
+        query: The role / topic description. Embedded, used for semantic
+            ranking.
+        max_tokens: Token budget for the returned `formatted` blob
+            (default 50k, cap 200k). Results are truncated to fit.
+        min_similarity: Filter results below this cosine similarity
+            (default 0.3 — practical threshold for "actually relevant").
+        category: Optional category filter.
+        tags: Optional ANY-match tag filter.
+        decay_alpha: Time-decay (Anderson/ACT-R). Default 0.3 — gently
+            prefer recent. Set 0 to disable.
+        include_body: If True, include the body of each memory in the
+            formatted output; if False, summaries only (much more memories
+            fit in the budget).
+    """
+    if EMBED_BACKEND == "none":
+        return {"error": "embeddings disabled; set ZETA_EMBED_BACKEND in .env"}
+    if not query or not query.strip():
+        return {"error": "query is required"}
+    max_tokens = max(100, min(max_tokens, 200_000))
+
+    # Over-fetch generously — we'll pack as many as fit in the budget.
+    search = semantic_search_memories(
+        query=query,
+        top_k=100,  # bring back a wide candidate set; we filter by budget
+        min_similarity=min_similarity,
+        category=category,
+        tags=tags,
+        decay_alpha=decay_alpha,
+    )
+    if "error" in search:
+        return search
+
+    candidates = search["results"]
+    if not candidates:
+        return {
+            "query": query,
+            "max_tokens": max_tokens,
+            "loaded_count": 0,
+            "skipped_count": 0,
+            "tokens_used": 0,
+            "formatted": "",
+        }
+
+    # Need bodies to format with body — re-fetch in a single query.
+    if include_body:
+        conn = _connect()
+        try:
+            ids = tuple(c["id"] for c in candidates)
+            ph = ",".join("?" * len(ids))
+            body_rows = conn.execute(
+                f"SELECT id, body FROM memories WHERE id IN ({ph})",
+                ids,
+            ).fetchall()
+            body_by_id = {r["id"]: r["body"] for r in body_rows}
+        finally:
+            conn.close()
+    else:
+        body_by_id = {}
+
+    # Pack into budget. Format per memory:
+    #   #<id>-<nickname?>  [category]  (score 0.8123)
+    #   <summary>
+    #   <body if include_body and present>
+    #   ---
+    chunks: list[str] = []
+    tokens_used = 0
+    loaded = 0
+    skipped = 0
+    for c in candidates:
+        header = f"#{c['id']}{('-' + c['nickname']) if c['nickname'] else ''}  [{c['category']}]  (score {c['score']:.3f}, sim {c['similarity']:.3f})"
+        lines = [header, c["summary"]]
+        if include_body:
+            body = body_by_id.get(c["id"])
+            if body:
+                lines.append(body)
+        if c.get("tags"):
+            lines.append("tags: " + ", ".join(c["tags"]))
+        block = "\n".join(lines) + "\n---\n"
+        block_tokens = _estimate_tokens(block)
+        if tokens_used + block_tokens > max_tokens:
+            skipped += 1
+            continue
+        chunks.append(block)
+        tokens_used += block_tokens
+        loaded += 1
+
+    formatted = "".join(chunks).rstrip()
+    return {
+        "query": query,
+        "max_tokens": max_tokens,
+        "tokens_used": tokens_used,
+        "loaded_count": loaded,
+        "skipped_count": skipped,
+        "candidates_considered": len(candidates),
+        "decay_alpha": decay_alpha,
+        "include_body": include_body,
+        "formatted": formatted,
+    }
 
 
 # --------------------------------------------------------------------------

@@ -1,2 +1,10 @@
 mcp[cli]>=1.2.0
 python-dotenv>=1.0.0
+
+# Embedding backend: API client + SQLite vector extension + tokenizer for
+# token-budget logic in bulk-load tools. All optional at runtime — if the
+# server starts without these and ZETA_EMBED_BACKEND=none (default), embed
+# / semantic-search code paths are skipped.
+openai>=1.50.0
+sqlite-vec>=0.1.6
+tiktoken>=0.8.0

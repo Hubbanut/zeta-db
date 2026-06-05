@@ -25,6 +25,36 @@ DB = HERE / "memories.smoketest.db"
 # import time inside server.py). This way the real memories.db is untouched.
 os.environ["ZETA_DB_PATH"] = str(DB)
 
+# Auto-enable embedding tests when openai is installed AND an API key is
+# locatable. Skip cleanly otherwise (the same code base supports adopters
+# without an OpenAI subscription). Looks for OPENAI_API_KEY in os.environ
+# first, then the maintainer's namespaced key, then llm-mcp's .env as a
+# Richard-specific fallback (one MCP folder over).
+try:
+    import openai  # noqa: F401
+    _HAS_OPENAI = True
+except ImportError:
+    _HAS_OPENAI = False
+
+if _HAS_OPENAI and not (
+    os.environ.get("OPENAI_API_KEY")
+    or os.environ.get("OPENAI_API_KEY_SIDE_PROJECTS_BRENT")
+):
+    _llm_env = HERE.parent / "llm-mcp" / ".env"
+    if _llm_env.exists():
+        for _line in _llm_env.read_text().splitlines():
+            _line = _line.strip()
+            if "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+_EMBED_AVAILABLE = _HAS_OPENAI and (
+    os.environ.get("OPENAI_API_KEY")
+    or os.environ.get("OPENAI_API_KEY_SIDE_PROJECTS_BRENT")
+)
+if _EMBED_AVAILABLE:
+    os.environ.setdefault("ZETA_EMBED_BACKEND", "openai")
+
 if DB.exists():
     DB.unlink()
 for suffix in ("-journal", "-wal", "-shm"):
@@ -35,16 +65,18 @@ for suffix in ("-journal", "-wal", "-shm"):
 sys.path.insert(0, str(HERE))
 from server import (  # noqa: E402
     add_category, add_chat, add_column, add_journal_entry,
-    add_memory, add_task, begin_work, check_subscriptions,
-    complete_task, complete_work, create_table, delete_journal_entry,
-    delete_memory, delete_task, describe_schema, get_audit_trail,
-    get_memory, get_task, get_work_log, list_categories,
+    add_memory, add_task, backfill_embeddings, begin_work,
+    bulk_load_context, check_subscriptions, complete_task,
+    complete_work, create_table, delete_journal_entry, delete_memory,
+    delete_task, describe_schema, get_audit_trail, get_memory,
+    get_task, get_work_log, hybrid_search_memories, list_categories,
     list_change_requests, list_chat, list_chat_channels,
     list_journal_entries, list_memories, list_recent_edits,
     list_subscriptions, list_tasks, list_work_logs, recent_activity,
     register_session, request_changes, search_chat,
-    search_journal_entries, search_memories, search_tasks, subscribe,
-    tick_checklist, unsubscribe, update_journal_entry,
+    search_journal_entries, search_memories, search_tasks,
+    semantic_search_memories, subscribe, tick_checklist, unsubscribe,
+    update_journal_entry,
     update_change_request, update_memory, update_task,
 )
 
@@ -1152,6 +1184,78 @@ check("unsubscribe removes the row", len(remaining) == 0)
 recent = recent_activity(limit=10)
 check("recent_activity returns events",
       "events" in recent and isinstance(recent["events"], list))
+
+
+# --------------------------------------------------------------------
+section("embeddings + semantic search (CR #16 / #17) — auto-detect")
+
+if not _EMBED_AVAILABLE:
+    check("embedding tests skipped (no openai pkg or no API key)", True)
+else:
+    # Re-import server's EMBED_BACKEND to confirm config landed.
+    from server import EMBED_BACKEND as _EB
+    check("EMBED_BACKEND is 'openai' once auto-detected",
+          _EB == "openai")
+
+    # Create a few semantically-distinct memories. Each gets embed-on-write.
+    m_db = add_memory(
+        summary="SQLite is a file-based relational database engine",
+        category="work",
+        body="Supports ACID, JSON, full-text via FTS5, vector via sqlite-vec.",
+        tags=["database", "storage"], session_id=SID,
+    )
+    m_cook = add_memory(
+        summary="Carbonara uses egg, hard cheese, guanciale, pepper",
+        category="family",
+        body="No cream — that's a non-traditional addition.",
+        tags=["cooking"], session_id=SID,
+    )
+    m_run = add_memory(
+        summary="Easy runs should sit around 70% of max HR",
+        category="exercise",
+        body="Higher zones cluster training stress; keep most volume easy.",
+        tags=["running"], session_id=SID,
+    )
+
+    # has_embedding flag set on hydrate?
+    fetched_db = get_memory(m_db["id"])
+    check("embed-on-write set has_embedding=True",
+          fetched_db.get("has_embedding") is True)
+    check("hydrated memory does NOT expose the raw embedding blob",
+          "embedding" not in fetched_db)
+
+    # Semantic search: a database-flavoured query should rank m_db first.
+    sem = semantic_search_memories(query="data persistence and SQL storage")
+    check("semantic search returns results", sem.get("count", 0) >= 1)
+    check("semantic search ranks database memory above the others",
+          sem["results"][0]["id"] == m_db["id"])
+    check("semantic search response includes similarity score",
+          0.0 <= sem["results"][0]["similarity"] <= 1.0)
+
+    # Time decay: alpha > 0 reduces score multiplicatively.
+    sem_decay = semantic_search_memories(
+        query="data persistence and SQL storage", decay_alpha=1.0,
+    )
+    check("decay_alpha reports a decay_factor",
+          sem_decay["results"][0]["decay_factor"] is not None)
+
+    # Hybrid: LIKE for 'cream' + semantic for cooking should surface m_cook.
+    hyb = hybrid_search_memories(query="italian dinner recipe", like_text="cream")
+    check("hybrid_search_memories returns results", hyb.get("count", 0) >= 1)
+
+    # Bulk load: ask for a small token budget and verify content fits.
+    bulk = bulk_load_context(
+        query="database engines and storage", max_tokens=2000, min_similarity=0.0,
+    )
+    check("bulk_load_context returns a formatted blob",
+          isinstance(bulk.get("formatted"), str) and bulk["tokens_used"] <= 2000)
+    check("bulk_load_context loaded at least one memory",
+          bulk.get("loaded_count", 0) >= 1)
+
+    # Backfill: should be a no-op now (all created with embeddings).
+    bf = backfill_embeddings(max_rows=5)
+    check("backfill_embeddings reports remaining count",
+          "remaining" in bf and isinstance(bf["remaining"], int))
 
 
 # --------------------------------------------------------------------
