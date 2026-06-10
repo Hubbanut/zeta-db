@@ -26,39 +26,52 @@ memories and tasks require a category. Initially seeded:
 list first to avoid near-duplicates (`home_improvements` vs `home_projects`
 vs `house`).
 
+**Layered retrieval (`detail`)** — every `list_*` / `search_*` tool
+accepts `detail`, four levels of increasing context cost:
+- `index` — one scan line per row: id, nickname, ~100 chars of
+  summary. For "what's there?" sweeps over many rows.
+- `summary` — the classic metadata view (full summary, tags, no body).
+  The default for memories/tasks.
+- `excerpt` — summary + the first ~280 chars of body (+ `body_chars`
+  so you know how much more `get_*` would fetch).
+- `full` — everything inline; saves a `get_*` round trip per hit.
+
+Most tools also accept `tag_mode='any'|'all'` ('all' = row must carry
+every listed tag).
+
 **Memories** — durable observations:
-- `add_memory(summary, category, body?, tags?, importance=3, requested_by_human=False, human_remark?, nickname?, session_id?)`
-- `update_memory(id, ...)` — pass only the fields you want to change. Passing `tags=[...]` *replaces* the existing tag set; omit `tags` to leave alone.
+- `add_memory(summary, category, body?, tags?, importance=3, requested_by_human=False, human_remark?, nickname?, session_id?)` — an over-length summary does NOT reject the call (CR #33): it's stored truncated (body intact), the response carries `summary_truncated` + `original_summary_length`, and you fix it with `update_memory(id, summary=...)` without resending the body.
+- `update_memory(id, ...)` — pass only the fields you want to change. Passing `tags=[...]` *replaces* the existing tag set; omit `tags` to leave alone. Over-length summary here still rejects (strict path; nothing expensive at risk).
 - `delete_memory(id)`
-- `list_memories(category?, tags?, since?, limit=20)` — summary view, body omitted. **Browsing**; does not bump `last_accessed`.
-- `search_memories(query, category?, tags?, limit=10)` — case-insensitive LIKE on summary AND body. Summary view. **Recall**; bumps `last_accessed`.
+- `list_memories(category?, tags?, since?, limit=20, detail='summary', tag_mode='any')` — **Browsing**; never bumps `last_accessed`, at any detail level.
+- `search_memories(query, category?, tags?, limit=10, detail='summary', tag_mode='any')` — case-insensitive LIKE on summary AND body. **Recall**; bumps `last_accessed`.
 - `get_memory(id)` — full row including body. **Recall**; bumps `last_accessed`.
-- `semantic_search_memories(query, top_k=10, min_similarity=0, category?, tags?, decay_alpha=0)` — vector-similarity search (CR #16). Requires `ZETA_EMBED_BACKEND=openai`. `decay_alpha>0` adds Anderson/ACT-R power-law time decay.
-- `hybrid_search_memories(query, like_text?, match_mode='any', top_k=10, ...)` — combines LIKE + similarity in one query (CR #17). `match_mode='any'` returns rows matching either; `'all'` requires both.
-- `bulk_load_context(query, max_tokens=50000, decay_alpha=0.3, include_body=True, ...)` — fetch most-relevant memories for a role/topic up to a token budget, formatted as context-sparing text. The `z load` verb's tool. Designed for new-session warmup.
+- `semantic_search_memories(query, top_k=10, min_similarity=0, category?, tags?, decay_alpha=0, detail='summary', tag_mode='any')` — vector-similarity search (CR #16). Requires `ZETA_EMBED_BACKEND=openai`. `decay_alpha>0` adds Anderson/ACT-R power-law time decay. **Recall**; bumps `last_accessed`.
+- `hybrid_search_memories(query, like_text?, match_mode='any', top_k=10, detail='summary', ...)` — combines LIKE + similarity in one query (CR #17). `match_mode='any'` returns rows matching either; `'all'` requires both. **Recall**; bumps `last_accessed`.
+- `bulk_load_context(query, max_tokens=18000, decay_alpha=0.3, detail='graduated', ...)` — fetch most-relevant memories for a role/topic up to a token budget, formatted as context-sparing text. The `z load` verb's tool, designed for new-session warmup. Default packing is **graduated**: top-ranked memories in full, then excerpts, then one-line index entries — depth where relevance is highest, breadth on the tail. The 18k default budget returns inline (CR #34 — budgets much above ~20k risk spilling past the client's tool-result cap); rows packed at full/excerpt count as recall.
 - `backfill_embeddings(max_rows=100)` — embed any memories with NULL embedding. Use after first enabling `ZETA_EMBED_BACKEND`, or after a model change.
 
 **Tasks** — to-dos with status and optional due dates:
-- `add_task(summary, category, body?, tags?, importance=3, due_date?, requested_by_human=False, human_remark?, nickname?, session_id?)`
+- `add_task(summary, category, body?, tags?, importance=3, due_date?, requested_by_human=False, human_remark?, nickname?, session_id?)` — over-length summary truncates-and-warns like `add_memory` (CR #33).
 - `update_task(id, ...)` — setting `status='done'` stamps `completed_at`; setting it away from `done` clears it.
 - `complete_task(id, session_id?)` — convenience wrapper.
 - `delete_task(id)`
-- `list_tasks(category?, status='open', tags?, due_before?, limit=20)` — defaults to open only. Pass `status=None` to include everything.
-- `search_tasks(query, category?, status='open', tags?, limit=10)` — keyword search across summary/body/nickname. Default status='open'.
+- `list_tasks(category?, status='open', tags?, due_before?, limit=20, detail='summary', tag_mode='any')` — defaults to open only. Pass `status=None` to include everything.
+- `search_tasks(query, category?, status='open', tags?, limit=10, detail='summary', tag_mode='any')` — keyword search across summary/body/nickname. Default status='open'.
 - `get_task(id)` — full row.
 
 **Group chat** — see "Group chat" section below:
 - `add_chat(body, channel='general', author_nickname?, tags?, session_id?)`
-- `list_chat(channel?, since?, tags?, author_nickname?, limit=20)`
-- `search_chat(query, channel?, tags?, limit=10)`
+- `list_chat(channel?, since?, tags?, author_nickname?, limit=20, detail='full', tag_mode='any')` — `detail` accepts 'index'/'excerpt'/'full' (no 'summary' — the body IS the content); 'index' is handy for skimming a long channel before pulling specific messages.
+- `search_chat(query, channel?, tags?, limit=10, detail='full', tag_mode='any')`
 - `list_chat_channels()` — discover existing channels
 
 **Journal** — see "Journaling" section below:
 - `add_journal_entry(entry_type, notes?, metrics?, timestamp?, tags?, session_id?)`
 - `update_journal_entry(id, ...)` — pass only the fields you want to change; tag handling matches `update_memory` (CR #26)
 - `delete_journal_entry(id, session_id?)` — audit row records the pre-delete snapshot (CR #26)
-- `list_journal_entries(entry_type?, since?, until?, tags?, limit=50)` — `entry_type` accepts LIKE patterns with `%`
-- `search_journal_entries(query, entry_type?, tags?, limit=10)`
+- `list_journal_entries(entry_type?, since?, until?, tags?, limit=50, detail='summary', tag_mode='any')` — `entry_type` accepts LIKE patterns with `%`
+- `search_journal_entries(query, entry_type?, tags?, limit=10, detail='full', tag_mode='any')`
 - `tick_checklist(item, timestamp?, notes?, session_id?)` — convenience for `add_journal_entry(entry_type=f"checklist:{item}")`
 
 **Work logs** — see "Work logs" section below:
@@ -106,12 +119,18 @@ vs `house`).
 
 ## `last_accessed` semantics
 
-Bumped on `get_memory` and `search_memories` — these are **recall**
-operations. Not bumped on `list_memories` — that's **browsing**, and
-counting it would defeat the purpose of using `last_accessed` to spot
-cruft. Periodically, the human (or you) can list memories ordered by
-`last_accessed ASC` and prune the ones nothing has touched in a long
-time. That signal only works if browsing doesn't pollute it.
+Bumped on **recall** operations: `get_memory`, `search_memories`,
+`semantic_search_memories`, `hybrid_search_memories` (all detail
+levels — search is recall), and on `bulk_load_context` rows packed at
+full or excerpt detail (they entered a session's context; index lines
+don't count). Retrieval-strengthens-memory is also why `decay_alpha`
+ranking keys off `last_accessed`.
+
+Never bumped on `list_*` — that's **browsing**, even at
+`detail='full'`. Deliberately: a pruning pass that lists memories by
+`last_accessed ASC` and reads their bodies must not destroy the very
+signal it's using to spot cruft. Periodically, the human (or you) can
+prune the ones nothing has recalled in a long time.
 
 `tasks` don't have `last_accessed` — their lifecycle is status-driven,
 not access-driven.
@@ -743,7 +762,7 @@ known verb.
 | `z work begin <text>` | `begin_work(description=<text>)` | start a work log (use prose to convey estimate: "z work begin Investigate flaky test, est 10 min") |
 | `z work done <id>` | `complete_work(id=<id>)` | finish a work log; reports verdict vs estimate |
 | `z audit <type> <id>` | `get_audit_trail(entity_type=<type>, entity_id=<id>)` | history of one entity (memory/task/journal/chat) |
-| `z load <role/topic prompt>` | `bulk_load_context(query=<text>)` | fetch top-relevance memories into ~50k-token block; semantic + time-decay ranked. The session-warmup verb. |
+| `z load <role/topic prompt>` | `bulk_load_context(query=<text>)` | fetch top-relevance memories into an ~18k-token graduated block (top hits in full, then excerpts, then index lines); semantic + time-decay ranked. The session-warmup verb. |
 | `z semsearch <query>` | `semantic_search_memories(query=<text>)` | top-10 memories by semantic similarity |
 | `z hybrid <query> [like:<text>]` | `hybrid_search_memories(query=<text>, like_text=<text>)` | combine LIKE + similarity |
 
@@ -802,7 +821,9 @@ Run the smoke test against an isolated scratch DB:
 ```
 
 It uses `memories.smoketest.db` (gitignored) and never touches the real
-`memories.db`. Currently 181 checks; all must pass.
+`memories.db`. Currently 258 checks; all must pass. The embedding
+checks call the real OpenAI API when a key is locatable and skip
+cleanly otherwise.
 
 ## Config
 
@@ -810,9 +831,12 @@ It uses `memories.smoketest.db` (gitignored) and never touches the real
 
 - `ZETA_DB_PATH` — path to the SQLite file. Default: `./memories.db`.
 - `ZETA_SUMMARY_TARGET=250` — advertised in docstrings; aim point
-- `ZETA_SUMMARY_MAX_LEN=400` — hard cap; rejection only past this
+- `ZETA_SUMMARY_MAX_LEN=400` — hard cap; past it, adds truncate-and-warn
+  (CR #33) while updates reject
 - `ZETA_LIST_HARD_LIMIT=200`
 - `ZETA_SEARCH_HARD_LIMIT=100`
+- `ZETA_INDEX_TRUNC_CHARS=100` — summary length at `detail='index'`
+- `ZETA_EXCERPT_BODY_CHARS=280` — body excerpt length at `detail='excerpt'`
 - `ZETA_EMBED_BACKEND=none` — `none` disables embeddings; `openai` enables vector search via the OpenAI API (needs `OPENAI_API_KEY`).
 - `ZETA_EMBED_MODEL=text-embedding-3-large` — the OpenAI embedding model to use.
 - `ZETA_EMBED_DIMS=1024` — Matryoshka-truncated dim (default 1024; the model natively serves 3072).

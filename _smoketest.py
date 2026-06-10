@@ -155,13 +155,31 @@ check("add_memory rejects importance out of range", "error" in bad)
 bad = add_memory(summary="x", category="nonexistent")
 check("add_memory rejects unknown category", "error" in bad)
 
-long_summary = "x" * 500
-bad = add_memory(summary=long_summary, category="work")
-check("add_memory rejects oversize summary (> 400 hard cap)", "error" in bad)
-# CR #22 / current spec: error message includes the measured length.
-check("oversize summary error includes measured length",
-      "error" in bad and "500" in bad["error"],
-      bad.get("error", ""))
+# CR #33: an oversize summary must never reject a call carrying a correct
+# body. The call succeeds, the summary is stored truncated, the body lands
+# intact, and the response says exactly what happened.
+long_summary = "word " * 100  # 500 chars
+trunc = add_memory(summary=long_summary, category="work",
+                   body="the precious body that must not be lost",
+                   session_id=SID)
+check("add_memory accepts oversize summary (CR #33 truncate-and-warn)",
+      "error" not in trunc, str(trunc))
+check("oversize summary response flags summary_truncated",
+      trunc.get("summary_truncated") is True)
+check("oversize summary response reports original length",
+      trunc.get("original_summary_length") == len(long_summary.strip()))
+trunc_view = get_memory(trunc["id"])
+check("truncated summary stored within hard cap",
+      len(trunc_view.get("summary", "")) <= 400)
+check("body stored intact alongside truncated summary",
+      trunc_view.get("body") == "the precious body that must not be lost")
+# The repair path: fix just the summary, no body re-send.
+fixed = update_memory(trunc["id"], summary="short corrected summary",
+                      session_id=SID)
+check("update_memory repairs the truncated summary",
+      fixed.get("summary") == "short corrected summary"
+      and fixed.get("body") == "the precious body that must not be lost")
+delete_memory(trunc["id"], session_id=SID)
 
 # Target is 250, hard cap is 400 — a 380-char summary is over target
 # but under the hard cap, and should be accepted silently.
@@ -171,18 +189,23 @@ check("add_memory accepts 380-char summary (over target, under cap)",
 # Response surfaces the actual length so the caller can self-calibrate.
 check("add_memory response includes summary_length",
       over_target.get("summary_length") == 380)
+check("under-cap summary is NOT flagged truncated",
+      "summary_truncated" not in over_target)
 delete_memory(over_target["id"], session_id=SID)
 
-# At the boundary: 400 chars exactly should still be accepted.
+# At the boundary: 400 chars exactly is stored verbatim.
 at_cap = add_memory(summary="x" * 400, category="work", session_id=SID)
-check("add_memory accepts 400-char summary (at hard cap)",
-      "error" not in at_cap)
+check("add_memory accepts 400-char summary (at hard cap) untruncated",
+      "error" not in at_cap and "summary_truncated" not in at_cap)
 delete_memory(at_cap["id"], session_id=SID)
 
-# 401 chars: rejected.
-just_over = add_memory(summary="x" * 401, category="work", session_id=SID)
-check("add_memory rejects 401-char summary (one over hard cap)",
-      "error" in just_over)
+# update_memory keeps the strict reject (no body at risk there).
+strict_target = add_memory(summary="strict update target", category="work",
+                           session_id=SID)
+bad = update_memory(strict_target["id"], summary="x" * 500)
+check("update_memory still rejects oversize summary (strict path)",
+      "error" in bad and "500" in bad.get("error", ""))
+delete_memory(strict_target["id"], session_id=SID)
 
 # Origin field (CR #14)
 om = add_memory(summary="origin field test memory", category="work",
@@ -318,6 +341,118 @@ check("search_memories rejects empty query", "error" in bad)
 
 
 # --------------------------------------------------------------------
+section("layered detail levels + tag_mode")
+
+# A memory with a long body to exercise excerpt truncation.
+layered = add_memory(
+    summary="Layered detail test memory with a deliberately longish summary "
+            "so index-level truncation has something to bite into, padding "
+            "padding padding",
+    category="work",
+    body="B" * 1000,
+    tags=["layer-a", "layer-b"],
+    session_id=SID,
+)
+LAYER_ID = layered["id"]
+
+idx = search_memories("Layered detail test", detail="index")
+idx_row = next(m for m in idx["memories"] if m["id"] == LAYER_ID)
+check("detail='index' truncates summary to ~100 chars",
+      len(idx_row["summary"]) <= 100 and idx_row["summary"].endswith("…"))
+check("detail='index' omits tags and body",
+      "tags" not in idx_row and "body" not in idx_row)
+
+exc = search_memories("Layered detail test", detail="excerpt")
+exc_row = next(m for m in exc["memories"] if m["id"] == LAYER_ID)
+check("detail='excerpt' returns a bounded body_excerpt",
+      len(exc_row.get("body_excerpt", "")) <= 280
+      and exc_row.get("body_chars") == 1000)
+check("detail='excerpt' omits the full body", "body" not in exc_row)
+
+ful = search_memories("Layered detail test", detail="full")
+ful_row = next(m for m in ful["memories"] if m["id"] == LAYER_ID)
+check("detail='full' returns the whole body inline",
+      ful_row.get("body") == "B" * 1000)
+
+bad = search_memories("Layered", detail="haiku")
+check("invalid detail level rejected", "error" in bad)
+
+lst_full = list_memories(category="work", detail="full")
+check("list_memories detail='full' includes bodies",
+      any(m.get("body") == "B" * 1000 for m in lst_full["memories"]))
+
+# list_* never bumps last_accessed, even at body-bearing detail levels —
+# pruning passes must not pollute the cruft signal.
+la_before = get_memory(LAYER_ID)["last_accessed"]
+time.sleep(1.1)
+list_memories(category="work", detail="full")
+import sqlite3 as _sq
+_c = _sq.connect(DB)
+la_after = _c.execute(
+    "SELECT last_accessed FROM memories WHERE id = ?", (LAYER_ID,)
+).fetchone()[0]
+_c.close()
+check("list_memories detail='full' does NOT bump last_accessed",
+      la_after == la_before, f"{la_before} -> {la_after}")
+
+# tag_mode: 'any' matches either tag; 'all' requires every tag.
+only_a = add_memory(summary="tag_mode probe with only layer-a",
+                    category="work", tags=["layer-a"], session_id=SID)
+any_hits = list_memories(tags=["layer-a", "layer-b"], tag_mode="any")
+check("tag_mode='any' matches single-tag rows",
+      any(m["id"] == only_a["id"] for m in any_hits["memories"]))
+all_hits = list_memories(tags=["layer-a", "layer-b"], tag_mode="all")
+check("tag_mode='all' excludes rows missing a tag",
+      not any(m["id"] == only_a["id"] for m in all_hits["memories"]))
+check("tag_mode='all' still matches rows carrying every tag",
+      any(m["id"] == LAYER_ID for m in all_hits["memories"]))
+delete_memory(only_a["id"], session_id=SID)
+delete_memory(LAYER_ID, session_id=SID)
+
+# Tasks: same layering.
+layer_task = add_task(summary="Layered task", category="work",
+                      body="T" * 600, tags=["layer-t1", "layer-t2"],
+                      session_id=SID)
+t_idx = list_tasks(category="work", detail="index")
+t_idx_row = next(t for t in t_idx["tasks"] if t["id"] == layer_task["id"])
+check("task detail='index' is a scan line (id/summary/status/category)",
+      "body" not in t_idx_row and "tags" not in t_idx_row
+      and t_idx_row.get("status") == "open")
+t_exc = search_tasks("Layered task", detail="excerpt")
+t_exc_row = next(t for t in t_exc["tasks"] if t["id"] == layer_task["id"])
+check("task detail='excerpt' bounds the body",
+      len(t_exc_row.get("body_excerpt", "")) <= 280
+      and t_exc_row.get("body_chars") == 600)
+t_ful = search_tasks("Layered task", detail="full")
+t_ful_row = next(t for t in t_ful["tasks"] if t["id"] == layer_task["id"])
+check("task detail='full' returns the whole body",
+      t_ful_row.get("body") == "T" * 600)
+t_all = list_tasks(tags=["layer-t1", "layer-t2"], tag_mode="all")
+check("list_tasks tag_mode='all' finds the fully-tagged task",
+      any(t["id"] == layer_task["id"] for t in t_all["tasks"]))
+delete_task(layer_task["id"], session_id=SID)
+
+# Journal: index strips to the timeline; excerpt bounds notes.
+layer_j = add_journal_entry(entry_type="life", notes="N" * 500,
+                            metrics={"k": 1}, session_id=SID)
+j_idx = list_journal_entries(entry_type="life", detail="index")
+j_idx_row = next(e for e in j_idx["entries"] if e["id"] == layer_j["id"])
+check("journal detail='index' is id + entry_type + timestamp only",
+      set(j_idx_row.keys()) == {"id", "entry_type", "timestamp"})
+j_exc = list_journal_entries(entry_type="life", detail="excerpt")
+j_exc_row = next(e for e in j_exc["entries"] if e["id"] == layer_j["id"])
+check("journal detail='excerpt' bounds notes and keeps metrics",
+      len(j_exc_row.get("notes_excerpt", "")) <= 280
+      and j_exc_row.get("notes_chars") == 500
+      and j_exc_row.get("metrics") == {"k": 1})
+j_ful = list_journal_entries(entry_type="life", detail="full")
+j_ful_row = next(e for e in j_ful["entries"] if e["id"] == layer_j["id"])
+check("journal detail='full' returns whole notes",
+      j_ful_row.get("notes") == "N" * 500)
+delete_journal_entry(layer_j["id"], session_id=SID)
+
+
+# --------------------------------------------------------------------
 section("update / delete memory")
 upd = update_memory(MID, importance=4, tags=["hardware", "cache", "latency"],
                     session_id=SID)
@@ -374,6 +509,18 @@ check("add_task minimal args", isinstance(t2.get("id"), int))
 
 bad = add_task(summary="x", category="work", importance=0)
 check("add_task rejects bad importance", "error" in bad)
+
+# CR #33 applies to tasks too: oversize summary truncates, body survives.
+t_trunc = add_task(summary="t" * 450, category="work",
+                   body="task body to preserve", session_id=SID)
+check("add_task truncate-and-warn on oversize summary (CR #33)",
+      "error" not in t_trunc and t_trunc.get("summary_truncated") is True
+      and t_trunc.get("original_summary_length") == 450)
+t_trunc_view = get_task(t_trunc["id"])
+check("add_task stores truncated summary + intact body",
+      len(t_trunc_view.get("summary", "")) <= 400
+      and t_trunc_view.get("body") == "task body to preserve")
+delete_task(t_trunc["id"], session_id=SID)
 
 got_t = get_task(TID)
 check("get_task returns full row",
@@ -731,6 +878,25 @@ check("search_chat finds by body",
 # Search rejects empty.
 bad = search_chat("")
 check("search_chat rejects empty query", "error" in bad)
+
+# Chat detail levels: full is default; index gives ~100-char scan lines.
+# Posted to a dedicated channel so design/general counts stay untouched.
+long_chat = add_chat(body="C" * 400, channel="detail-test",
+                     author_nickname="Hermes", session_id=SID)
+chat_idx = list_chat(channel="detail-test", detail="index")
+idx_msg = next(m for m in chat_idx["messages"] if m["id"] == long_chat["id"])
+check("list_chat detail='index' truncates body to a scan line",
+      len(idx_msg["body"]) <= 100 and "tags" not in idx_msg)
+chat_exc = search_chat("CCCC", channel="detail-test", detail="excerpt")
+exc_msg = next(m for m in chat_exc["messages"] if m["id"] == long_chat["id"])
+check("search_chat detail='excerpt' bounds body and reports body_chars",
+      len(exc_msg["body"]) <= 280 and exc_msg.get("body_chars") == 400)
+chat_ful = list_chat(channel="detail-test", detail="full")
+ful_msg = next(m for m in chat_ful["messages"] if m["id"] == long_chat["id"])
+check("list_chat detail='full' returns the whole body",
+      ful_msg["body"] == "C" * 400)
+bad = list_chat(detail="summary")
+check("chat rejects detail='summary' (body IS the content)", "error" in bad)
 
 # Channels listing.
 channels = list_chat_channels()
@@ -1243,6 +1409,34 @@ else:
     hyb = hybrid_search_memories(query="italian dinner recipe", like_text="cream")
     check("hybrid_search_memories returns results", hyb.get("count", 0) >= 1)
 
+    # Detail levels on the semantic tools.
+    sem_idx = semantic_search_memories(
+        query="data persistence and SQL storage", detail="index")
+    check("semantic search detail='index' returns scan lines",
+          sem_idx["count"] >= 1 and "tags" not in sem_idx["results"][0]
+          and "score" in sem_idx["results"][0])
+    sem_full = semantic_search_memories(
+        query="data persistence and SQL storage", detail="full")
+    top_full = next(r for r in sem_full["results"] if r["id"] == m_db["id"])
+    check("semantic search detail='full' includes the body",
+          "ACID" in (top_full.get("body") or ""))
+    hyb_exc = hybrid_search_memories(
+        query="italian dinner recipe", like_text="cream", detail="excerpt")
+    check("hybrid search detail='excerpt' carries body_excerpt",
+          any("body_excerpt" in r for r in hyb_exc["results"]))
+
+    # Semantic search is recall: it bumps last_accessed.
+    la_pre = sqlite3.connect(DB).execute(
+        "SELECT last_accessed FROM memories WHERE id = ?", (m_db["id"],)
+    ).fetchone()[0]
+    time.sleep(1.1)
+    semantic_search_memories(query="data persistence and SQL storage")
+    la_post = sqlite3.connect(DB).execute(
+        "SELECT last_accessed FROM memories WHERE id = ?", (m_db["id"],)
+    ).fetchone()[0]
+    check("semantic search bumps last_accessed (recall)",
+          la_post > la_pre, f"{la_pre} -> {la_post}")
+
     # Bulk load: ask for a small token budget and verify content fits.
     bulk = bulk_load_context(
         query="database engines and storage", max_tokens=2000, min_similarity=0.0,
@@ -1251,6 +1445,49 @@ else:
           isinstance(bulk.get("formatted"), str) and bulk["tokens_used"] <= 2000)
     check("bulk_load_context loaded at least one memory",
           bulk.get("loaded_count", 0) >= 1)
+    check("bulk_load_context reports detail_counts",
+          isinstance(bulk.get("detail_counts"), dict)
+          and sum(bulk["detail_counts"].values()) == bulk["loaded_count"])
+    bulk_ranked = bulk_load_context(
+        query="data persistence and SQL storage", max_tokens=2000,
+        min_similarity=0.0, decay_alpha=0.0,
+    )
+    check("bulk_load_context top-ranked memory loads at full detail",
+          bulk_ranked["formatted"].startswith(f"#{m_db['id']}")
+          and "ACID" in bulk_ranked["formatted"])
+
+    # CR #34: the default budget must be inline-safe (18k, capped at 60k).
+    bulk_default = bulk_load_context(query="database engines and storage",
+                                     min_similarity=0.0)
+    check("bulk_load_context default budget is 18k (CR #34)",
+          bulk_default.get("max_tokens") == 18000)
+    bulk_capped = bulk_load_context(query="database engines and storage",
+                                    max_tokens=999_999, min_similarity=0.0)
+    check("bulk_load_context caps the budget at 60k",
+          bulk_capped.get("max_tokens") == 60000)
+
+    # A tiny budget forces graduated demotion: blocks that don't fit at
+    # full detail land as excerpts/index lines instead of being skipped.
+    bulk_tiny = bulk_load_context(
+        query="database engines and storage", max_tokens=150, min_similarity=0.0,
+    )
+    check("graduated packing demotes rather than skips on tiny budgets",
+          bulk_tiny["loaded_count"] >= 1 and bulk_tiny["tokens_used"] <= 150,
+          str(bulk_tiny.get("detail_counts")))
+
+    # Uniform summary-only mode (and the deprecated include_body=False path).
+    bulk_sum = bulk_load_context(
+        query="database engines and storage", min_similarity=0.0,
+        detail="summary",
+    )
+    check("bulk_load_context detail='summary' omits bodies",
+          "ACID" not in bulk_sum["formatted"])
+    bulk_legacy = bulk_load_context(
+        query="database engines and storage", min_similarity=0.0,
+        include_body=False,
+    )
+    check("legacy include_body=False maps to detail='summary'",
+          bulk_legacy.get("detail") == "summary")
 
     # Backfill: should be a no-op now (all created with embeddings).
     bf = backfill_embeddings(max_rows=5)

@@ -14,3 +14,6 @@ memories.smoketest.db-shm
 # Dated backups (e.g. memories.db.backup-2026-05-21) — local-only, don't ship.
 memories.db.backup-*
 memories.migration-test.db*
+# Successor handover — written for the next Opus session picking up zeta-db
+# work; lives on Richard's disk, not in the public repo.
+handover.md

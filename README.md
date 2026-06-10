@@ -75,14 +75,21 @@ evaporating at session-end.
 
 ## Status
 
-**Work in progress, v0.** Built between 2026-05-20 and 2026-05-28.
-The server is functional and stable for a single user; the smoketest
-covers 181 checks. Several features are designed but not yet
-implemented:
+**Work in progress, v0.** First built 2026-05-20 to 2026-05-28 and
+evolving since. The server is functional and stable for a single
+user; the smoketest covers 258 checks. Since the initial release:
 
-- Embeddings / semantic search yet (planned: `sqlite-vec` +
-  `bge-small-en-v1.5`)
-- Bulk-pull tools for loading relevant context in new sessions
+- **Embeddings + semantic search** (optional, OpenAI backend +
+  `sqlite-vec`): `semantic_search_memories`, `hybrid_search_memories`,
+  and `bulk_load_context` — a token-budgeted bulk-pull for warming up
+  new sessions, with ACT-R-style time decay.
+- **Layered retrieval**: every `list_*`/`search_*` takes
+  `detail='index'|'summary'|'excerpt'|'full'`, so callers trade
+  context for depth; `bulk_load_context` packs graduated output
+  (top hits in full, then excerpts, then one-line index entries).
+- **Forgiving writes**: an over-length summary no longer rejects a
+  call carrying a large body — it's stored truncated with a warning
+  and fixable via `update_*` without resending the body.
 
 **On the model framing:** ZetaDB is model-agnostic by design — the
 substrate doesn't bind to any vendor, and the schema and tool names
@@ -186,9 +193,13 @@ is the natural starting point.
 `.env` keys (all optional, defaults shown in `.env.example`):
 
 - `ZETA_DB_PATH` — path to the SQLite file. Default: `./memories.db`.
-- `ZETA_SUMMARY_MAX_LEN=300`
+- `ZETA_SUMMARY_TARGET=250` / `ZETA_SUMMARY_MAX_LEN=400`
 - `ZETA_LIST_HARD_LIMIT=200`
 - `ZETA_SEARCH_HARD_LIMIT=100`
+- `ZETA_INDEX_TRUNC_CHARS=100` / `ZETA_EXCERPT_BODY_CHARS=280` —
+  layered-retrieval truncation lengths
+- `ZETA_EMBED_BACKEND=none` — set to `openai` (with `OPENAI_API_KEY`)
+  to enable semantic search; see `.env.example`
 
 ## Testing
 
@@ -201,7 +212,9 @@ is the natural starting point.
 ```
 
 Uses a scratch DB (`memories.smoketest.db`, gitignored) so it never
-touches your real `memories.db`. All 181 checks must pass.
+touches your real `memories.db`. All checks (currently 258) must pass.
+The embedding checks call the real OpenAI API when a key is available
+and skip cleanly otherwise.
 
 ## License
 

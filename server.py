@@ -29,11 +29,18 @@ Schema flexibility:
     request_changes for the human to review.
   - Every schema change is logged to schema_history.
 
-Two-tier retrieval:
-  - list_* and search_* return the summary view (no body) to save context.
+Layered retrieval:
+  - Every list_*/search_* accepts detail='index'|'summary'|'excerpt'|'full'
+    so callers can trade context for depth: index is one ~100-char scan
+    line per row, summary is the classic metadata view, excerpt adds the
+    first ~280 chars of body, full returns everything inline.
   - get_* returns the full row including body.
-  - last_accessed bumps on get_* and search_* (recall), not on list_*
-    (browsing).
+  - bulk_load_context packs graduated output by default: top-ranked
+    memories at full detail, then excerpts, then index lines.
+  - last_accessed bumps on get_*, on all search_* (keyword, semantic,
+    hybrid — search is recall), and on bulk_load rows packed at
+    full/excerpt. Never on list_* (browsing), at any detail level, so
+    pruning passes don't pollute the cruft signal.
 """
 
 from __future__ import annotations
@@ -66,6 +73,16 @@ DB_PATH = Path(_env("ZETA_DB_PATH") or (Path(__file__).parent / "memories.db"))
 # `summary_length` so the caller can self-calibrate without server help.
 SUMMARY_TARGET = int(_env("ZETA_SUMMARY_TARGET", "250") or "250")
 SUMMARY_MAX_LEN = int(_env("ZETA_SUMMARY_MAX_LEN", "400") or "400")
+
+# Layered retrieval detail (CR #34 follow-through). Every list_*/search_*
+# tool accepts a `detail` level so callers can trade context for depth:
+#   index   -> id + nickname + ~INDEX_TRUNC_CHARS of summary. One scan line.
+#   summary -> the classic summary view (full summary, metadata, tags).
+#   excerpt -> summary view + the first ~EXCERPT_BODY_CHARS of body.
+#   full    -> everything, body included (what get_* returns).
+DETAIL_LEVELS = ("index", "summary", "excerpt", "full")
+INDEX_TRUNC_CHARS = int(_env("ZETA_INDEX_TRUNC_CHARS", "100") or "100")
+EXCERPT_BODY_CHARS = int(_env("ZETA_EXCERPT_BODY_CHARS", "280") or "280")
 
 # Embedding backend (CR #16). Default 'none' means no embeddings are
 # computed and semantic_search_memories is a no-op. Switch to 'openai'
@@ -632,8 +649,66 @@ def _get_tags(
     return [r["tag_name"] for r in rows]
 
 
-def _hydrate_memory(conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool) -> dict[str, Any]:
+def _truncate(text: str | None, limit: int) -> str | None:
+    """Hard-truncate to `limit` chars, ellipsis included, word-boundary
+    preferred. Returns text unchanged when it already fits."""
+    if text is None or len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    # Back up to the last space if one falls in the final quarter — a
+    # mid-word chop reads worse than a slightly shorter line.
+    space = cut.rfind(" ")
+    if space > limit * 3 // 4:
+        cut = cut[:space]
+    return cut.rstrip() + "…"
+
+
+def _validate_detail(detail: str, allowed: tuple[str, ...] = DETAIL_LEVELS) -> str | None:
+    if detail not in allowed:
+        return f"detail must be one of {list(allowed)}"
+    return None
+
+
+def _tag_filter(
+    join_table: str, fk_column: str, owner_alias: str,
+    tags: list[str] | None, tag_mode: str,
+) -> tuple[str | None, list[Any]]:
+    """Build the tag-filter WHERE fragment shared by every list_*/search_*.
+
+    tag_mode 'any' (default): row matches if it carries at least one of the
+    tags. 'all': row must carry every tag (AND-match).
+    Returns (sql_fragment | None, params).
+    """
+    clean = [t.strip().lower() for t in (tags or []) if t.strip()]
+    if not clean:
+        return None, []
+    ph = ",".join("?" * len(clean))
+    if tag_mode == "all":
+        return (
+            f"{owner_alias}.id IN (SELECT {fk_column} FROM {join_table} "
+            f"WHERE tag_name IN ({ph}) GROUP BY {fk_column} "
+            f"HAVING COUNT(DISTINCT tag_name) = ?)",
+            [*clean, len(clean)],
+        )
+    return (
+        f"{owner_alias}.id IN (SELECT {fk_column} FROM {join_table} "
+        f"WHERE tag_name IN ({ph}))",
+        list(clean),
+    )
+
+
+def _hydrate_memory(
+    conn: sqlite3.Connection, row: sqlite3.Row, *, detail: str = "summary"
+) -> dict[str, Any]:
     d = dict(row)
+    if detail == "index":
+        # Tightest layer: one scan line per row, null fields dropped.
+        out = {"id": d["id"], "summary": _truncate(d["summary"], INDEX_TRUNC_CHARS)}
+        if d.get("nickname"):
+            out["nickname"] = d["nickname"]
+        out["category"] = _category_name(conn, d["category_id"])
+        out["importance"] = d["importance"]
+        return out
     d["category"] = _category_name(conn, d.pop("category_id"))
     d["requested_by_human"] = bool(d["requested_by_human"])
     d["tags"] = _get_tags(conn, "memory_tags", "memory_id", d["id"])
@@ -642,27 +717,46 @@ def _hydrate_memory(conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool) -
     # the row has been embedded.
     embed = d.pop("embedding", None)
     d["has_embedding"] = embed is not None
-    # nickname and origin stay in both full and summary views — both
-    # are scan-time identifiers.
-    if not full:
-        d.pop("body", None)
+    # nickname and origin stay in all views — both are scan-time identifiers.
+    if detail in ("summary", "excerpt"):
+        body = d.pop("body", None)
         d.pop("human_remark", None)
         d.pop("session_id", None)
         d.pop("created_at", None)
         d.pop("last_accessed", None)
+        if detail == "excerpt" and body:
+            d["body_excerpt"] = _truncate(body, EXCERPT_BODY_CHARS)
+            d["body_chars"] = len(body)
     return d
 
 
-def _hydrate_chat(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+def _hydrate_chat(
+    conn: sqlite3.Connection, row: sqlite3.Row, *, detail: str = "full"
+) -> dict[str, Any]:
     d = dict(row)
+    if detail == "index":
+        return {
+            "id": d["id"],
+            "channel": d["channel"],
+            "author_nickname": d["author_nickname"],
+            "body": _truncate(d["body"], INDEX_TRUNC_CHARS),
+            "created_at": d["created_at"],
+        }
+    if detail == "excerpt":
+        body = d["body"]
+        d["body"] = _truncate(body, EXCERPT_BODY_CHARS)
+        if body and len(body) > EXCERPT_BODY_CHARS:
+            d["body_chars"] = len(body)
     d["tags"] = _get_tags(conn, "group_chat_tags", "chat_id", d["id"])
     return d
 
 
 def _hydrate_journal(
-    conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool
+    conn: sqlite3.Connection, row: sqlite3.Row, *, detail: str = "summary"
 ) -> dict[str, Any]:
     d = dict(row)
+    if detail == "index":
+        return {"id": d["id"], "entry_type": d["entry_type"], "timestamp": d["timestamp"]}
     d["tags"] = _get_tags(conn, "journal_entry_tags", "entry_id", d["id"])
     # metrics is stored as JSON text; surface as a parsed dict if present.
     if d.get("metrics"):
@@ -670,25 +764,48 @@ def _hydrate_journal(
             d["metrics"] = json.loads(d["metrics"])
         except (TypeError, json.JSONDecodeError):
             pass  # leave raw if malformed
-    if not full:
-        d.pop("notes", None)
-        d.pop("metrics", None)
+    if detail in ("summary", "excerpt"):
+        notes = d.pop("notes", None)
+        metrics = d.pop("metrics", None)
         d.pop("session_id", None)
         d.pop("created_at", None)
+        if detail == "excerpt":
+            if notes:
+                d["notes_excerpt"] = _truncate(notes, EXCERPT_BODY_CHARS)
+                d["notes_chars"] = len(notes)
+            if metrics:
+                d["metrics"] = metrics
     return d
 
 
-def _hydrate_task(conn: sqlite3.Connection, row: sqlite3.Row, *, full: bool) -> dict[str, Any]:
+def _hydrate_task(
+    conn: sqlite3.Connection, row: sqlite3.Row, *, detail: str = "summary"
+) -> dict[str, Any]:
     d = dict(row)
+    if detail == "index":
+        out = {
+            "id": d["id"],
+            "summary": _truncate(d["summary"], INDEX_TRUNC_CHARS),
+            "status": d["status"],
+        }
+        if d.get("nickname"):
+            out["nickname"] = d["nickname"]
+        out["category"] = _category_name(conn, d["category_id"])
+        if d.get("due_date"):
+            out["due_date"] = d["due_date"]
+        return out
     d["category"] = _category_name(conn, d.pop("category_id"))
     d["requested_by_human"] = bool(d["requested_by_human"])
     d["tags"] = _get_tags(conn, "task_tags", "task_id", d["id"])
-    # nickname stays in both full and summary views — it's the point.
-    if not full:
-        d.pop("body", None)
+    # nickname stays in all views — it's the point.
+    if detail in ("summary", "excerpt"):
+        body = d.pop("body", None)
         d.pop("human_remark", None)
         d.pop("session_id", None)
         d.pop("created_at", None)
+        if detail == "excerpt" and body:
+            d["body_excerpt"] = _truncate(body, EXCERPT_BODY_CHARS)
+            d["body_chars"] = len(body)
     return d
 
 
@@ -703,6 +820,9 @@ def _bump_memory_accessed(conn: sqlite3.Connection, ids: list[int]) -> None:
 
 
 def _validate_summary(summary: str) -> str | None:
+    """Strict summary validator — used on the UPDATE paths, where a reject
+    is cheap (no body re-transmission). The ADD paths use _prepare_summary
+    instead (CR #33: truncate-and-warn)."""
     s = summary.strip() if summary else ""
     if not s:
         return "summary is required"
@@ -715,6 +835,35 @@ def _validate_summary(summary: str) -> str | None:
             f"aim for <= {SUMMARY_TARGET})"
         )
     return None
+
+
+def _prepare_summary(summary: str, update_tool: str) -> tuple[str, dict[str, Any] | None, str | None]:
+    """Lenient summary intake for the ADD paths (CR #33).
+
+    An over-length summary must never reject a call that carries a correct
+    body — the body is the expensive, already-final field; the summary is a
+    lossy index field. Over the hard cap we store a truncated summary, keep
+    the body intact, and tell the caller how to fix just the summary.
+
+    Returns (stored_summary, truncation_info | None, error | None).
+    """
+    s = summary.strip() if summary else ""
+    if not s:
+        return "", None, "summary is required"
+    if len(s) > SUMMARY_MAX_LEN:
+        stored = _truncate(s, SUMMARY_MAX_LEN)
+        info = {
+            "summary_truncated": True,
+            "original_summary_length": len(s),
+            "stored_summary_length": len(stored),
+            "note": (
+                f"summary exceeded the {SUMMARY_MAX_LEN}-char hard cap and was "
+                f"truncated; the body was stored intact. To fix the summary, "
+                f"call {update_tool}(id, summary=...) — no need to resend the body."
+            ),
+        }
+        return stored, info, None
+    return s, None, None
 
 
 def _validate_importance(importance: int) -> str | None:
@@ -1401,8 +1550,11 @@ def add_memory(
         summary: Short form (required). Aim for ≤ 250 chars; hard cap
             is 400. Going over 250 is silently accepted, but the response
             includes `summary_length` so you can self-calibrate without
-            being rejected. Past the 400 hard cap the error message
-            includes the measured length, so you can trim once precisely.
+            being rejected. Past the 400 hard cap the call still succeeds
+            (CR #33): the summary is stored truncated, the body is stored
+            intact, and the response carries `summary_truncated` +
+            `original_summary_length` — fix with update_memory(id,
+            summary=...) without resending the body.
         category: Must already exist (call list_categories / add_category first).
         body: Optional long-form content. Use when there's context,
             background, sub-steps, or links to capture beyond the summary
@@ -1455,7 +1607,8 @@ def add_memory(
             if salvaged.get("session_id") is not None and session_id is None:
                 session_id = salvaged["session_id"]; recovered["session_id"] = session_id
 
-    if (err := _validate_summary(summary)):
+    stored_summary, truncation, err = _prepare_summary(summary, "update_memory")
+    if err:
         return {"error": err}
     if (err := _validate_importance(importance)):
         return {"error": err}
@@ -1479,7 +1632,7 @@ def add_memory(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                summary.strip(),
+                stored_summary,
                 body,
                 cat_id,
                 importance,
@@ -1499,7 +1652,7 @@ def add_memory(
         # CR #16: embed on write. Best-effort — if the embed backend is
         # off / misconfigured / unreachable, the memory is still saved
         # and can be embedded later via backfill_embeddings().
-        embed_blob = _try_embed_memory(summary.strip(), body)
+        embed_blob = _try_embed_memory(stored_summary, body)
         if embed_blob is not None:
             conn.execute(
                 "UPDATE memories SET embedding = ? WHERE id = ?",
@@ -1508,7 +1661,7 @@ def add_memory(
 
         # CR #20 audit
         _audit_create(conn, "memory", memory_id, {
-            "summary": summary.strip(),
+            "summary": stored_summary,
             "body": body,
             "importance": importance,
             "requested_by_human": bool(requested_by_human),
@@ -1523,8 +1676,10 @@ def add_memory(
             "id": memory_id,
             "nickname": cleaned_nick,
             "created_at": now,
-            "summary_length": len(summary.strip()),
+            "summary_length": len(stored_summary),
         }
+        if truncation:
+            out.update(truncation)
         if recovered:
             out["recovered_from_body"] = recovered
         return out
@@ -1658,7 +1813,7 @@ def update_memory(
                 )
 
         row = conn.execute("SELECT * FROM memories WHERE id = ?", (id,)).fetchone()
-        return _hydrate_memory(conn, row, full=True)
+        return _hydrate_memory(conn, row, detail="full")
     finally:
         conn.close()
 
@@ -1699,18 +1854,29 @@ def list_memories(
     tags: list[str] | None = None,
     since: str | None = None,
     limit: int = 20,
+    detail: str = "summary",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
-    """Browse memories (summary view, body omitted).
+    """Browse memories.
 
-    Does NOT bump last_accessed (browsing != recall). Use get_memory for that.
+    Does NOT bump last_accessed at any detail level (browsing != recall) —
+    deliberately, so pruning passes can read bodies without polluting the
+    cruft signal. Use get_memory / search_memories for recall.
 
     Args:
         category: Filter by category name.
-        tags: Filter to memories tagged with ANY of these (OR).
+        tags: Filter by tags (see tag_mode).
         since: ISO-8601 cutoff; only memories updated after this.
         limit: Max rows, default 20, hard cap 200.
+        detail: 'index' (one scan line per row), 'summary' (default — full
+            summary + metadata, body omitted), 'excerpt' (summary +
+            first ~280 chars of body), 'full' (everything).
+        tag_mode: 'any' (default — row carries at least one tag) or
+            'all' (row must carry every tag).
     """
     limit = max(1, min(limit, LIST_HARD_LIMIT))
+    if (err := _validate_detail(detail)):
+        return {"error": err}
     conn = _connect()
     try:
         wheres: list[str] = []
@@ -1723,22 +1889,15 @@ def list_memories(
             wheres.append("m.category_id = ?"); params.append(cat_id)
         if since is not None:
             wheres.append("m.updated_at >= ?"); params.append(since)
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"m.id IN (SELECT memory_id FROM memory_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("memory_tags", "memory_id", "m", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
         params.append(limit)
         rows = conn.execute(
             f"""
-            SELECT m.id, m.summary, m.category_id, m.importance,
-                   m.requested_by_human, m.nickname, m.origin, m.updated_at
+            SELECT m.*
             FROM memories m
             {where_sql}
             ORDER BY m.updated_at DESC
@@ -1747,7 +1906,7 @@ def list_memories(
             params,
         ).fetchall()
         return {
-            "memories": [_hydrate_memory(conn, r, full=False) for r in rows],
+            "memories": [_hydrate_memory(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
@@ -1760,21 +1919,29 @@ def search_memories(
     category: str | None = None,
     tags: list[str] | None = None,
     limit: int = 10,
+    detail: str = "summary",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
-    """Keyword search across summary and body (summary view).
+    """Keyword search across summary and body.
 
     Case-insensitive LIKE on both summary and body. Bumps last_accessed on
-    every returned row.
+    every returned row (search = recall), at every detail level.
 
     Args:
         query: Search string (matched as %query%).
         category: Optional category filter.
-        tags: Optional tag filter (ANY).
+        tags: Optional tag filter (see tag_mode).
         limit: Max rows, default 10, hard cap 100.
+        detail: 'index' (one scan line per row), 'summary' (default),
+            'excerpt' (summary + first ~280 chars of body), 'full'
+            (everything — saves a get_memory round trip per hit).
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
     """
     if not query or not query.strip():
         return {"error": "query is required"}
     limit = max(1, min(limit, SEARCH_HARD_LIMIT))
+    if (err := _validate_detail(detail)):
+        return {"error": err}
     like = f"%{query.strip()}%"
 
     conn = _connect()
@@ -1787,21 +1954,14 @@ def search_memories(
             if cat_id is None:
                 return {"error": f"unknown category '{category}'"}
             wheres.append("m.category_id = ?"); params.append(cat_id)
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"m.id IN (SELECT memory_id FROM memory_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("memory_tags", "memory_id", "m", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         params.append(limit)
         rows = conn.execute(
             f"""
-            SELECT m.id, m.summary, m.category_id, m.importance,
-                   m.requested_by_human, m.nickname, m.origin, m.updated_at
+            SELECT m.*
             FROM memories m
             WHERE {' AND '.join(wheres)}
             ORDER BY m.importance DESC, m.updated_at DESC
@@ -1811,7 +1971,7 @@ def search_memories(
         ).fetchall()
         _bump_memory_accessed(conn, [r["id"] for r in rows])
         return {
-            "memories": [_hydrate_memory(conn, r, full=False) for r in rows],
+            "memories": [_hydrate_memory(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
@@ -1829,7 +1989,7 @@ def get_memory(id: int) -> dict[str, Any]:
         _bump_memory_accessed(conn, [id])
         # Re-fetch so the returned row reflects the bump.
         row = conn.execute("SELECT * FROM memories WHERE id = ?", (id,)).fetchone()
-        return _hydrate_memory(conn, row, full=True)
+        return _hydrate_memory(conn, row, detail="full")
     finally:
         conn.close()
 
@@ -1930,39 +2090,34 @@ def backfill_embeddings(max_rows: int = 100) -> dict[str, Any]:
         conn.close()
 
 
-@mcp.tool()
-def semantic_search_memories(
+def _semantic_candidates(
     query: str,
-    top_k: int = 10,
-    min_similarity: float = 0.0,
-    category: str | None = None,
-    tags: list[str] | None = None,
-    decay_alpha: float = 0.0,
-) -> dict[str, Any]:
-    """Find memories semantically similar to the query (CR #16).
+    top_k: int,
+    min_similarity: float,
+    category: str | None,
+    tags: list[str] | None,
+    decay_alpha: float,
+    tag_mode: str = "any",
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
+    """Shared candidate fetch for semantic_search / bulk_load_context.
 
-    Args:
-        query: Free-text — embedded via the configured backend.
-        top_k: Max results (default 10, hard cap 100).
-        min_similarity: Filter out cosine similarities below this (0..1).
-        category: Optional category filter.
-        tags: Optional ANY-match tag filter.
-        decay_alpha: Time-decay aggressiveness (Anderson/ACT-R power-law).
-            0 = no decay (pure semantic), 0.5 = gentle, 1.0 = aggressive.
-            Final score = similarity * (1 + days_since_last_access)^(-alpha).
+    Returns (candidates, error). Candidates are sorted by decayed score and
+    trimmed to top_k; each carries `body` so callers can shape detail levels
+    without a second query. Does NOT bump last_accessed — that's the public
+    tools' responsibility (they know what actually got surfaced).
     """
     if EMBED_BACKEND == "none":
-        return {"error": "embeddings disabled; set ZETA_EMBED_BACKEND in .env"}
+        return None, {"error": "embeddings disabled; set ZETA_EMBED_BACKEND in .env"}
     if not query or not query.strip():
-        return {"error": "query is required"}
+        return None, {"error": "query is required"}
     top_k = max(1, min(top_k, 100))
 
     try:
         qvec = _embed_text(query)
     except Exception as e:
-        return {"error": f"embedding query failed: {e}"}
+        return None, {"error": f"embedding query failed: {e}"}
     if qvec is None:
-        return {"error": "no embedding produced for query"}
+        return None, {"error": "no embedding produced for query"}
 
     conn = _connect()
     try:
@@ -1971,18 +2126,12 @@ def semantic_search_memories(
         if category:
             cat_id = _resolve_category(conn, category.strip().lower())
             if cat_id is None:
-                return {"error": f"unknown category '{category}'"}
+                return None, {"error": f"unknown category '{category}'"}
             wheres.append("m.category_id = ?")
             params.append(cat_id)
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                ph = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"m.id IN (SELECT memory_id FROM memory_tags "
-                    f"WHERE tag_name IN ({ph}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("memory_tags", "memory_id", "m", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         where_clause = " AND ".join(wheres)
         # Over-fetch by 3x so decay re-ranking doesn't push the right rows
@@ -2008,6 +2157,7 @@ def semantic_search_memories(
             results.append({
                 "id": r["id"],
                 "summary": r["summary"],
+                "body": r["body"],
                 "category": _category_name(conn, r["category_id"]),
                 "importance": r["importance"],
                 "nickname": r["nickname"],
@@ -2021,10 +2171,79 @@ def semantic_search_memories(
 
         # Re-rank by decayed score and trim to top_k.
         results.sort(key=lambda d: d["score"], reverse=True)
-        results = results[:top_k]
-        return {"query": query, "count": len(results), "results": results}
+        return results[:top_k], None
     finally:
         conn.close()
+
+
+def _shape_search_hit(hit: dict[str, Any], detail: str) -> dict[str, Any]:
+    """Shape a semantic/hybrid hit (which carries body + ranking fields)
+    to the requested detail level."""
+    if detail == "index":
+        out: dict[str, Any] = {
+            "id": hit["id"],
+            "summary": _truncate(hit["summary"], INDEX_TRUNC_CHARS),
+        }
+        if hit.get("nickname"):
+            out["nickname"] = hit["nickname"]
+        out["category"] = hit["category"]
+        out["score"] = hit["score"]
+        return out
+    out = {k: v for k, v in hit.items() if k != "body"}
+    body = hit.get("body")
+    if detail == "excerpt" and body:
+        out["body_excerpt"] = _truncate(body, EXCERPT_BODY_CHARS)
+        out["body_chars"] = len(body)
+    elif detail == "full":
+        out["body"] = body
+    return out
+
+
+@mcp.tool()
+def semantic_search_memories(
+    query: str,
+    top_k: int = 10,
+    min_similarity: float = 0.0,
+    category: str | None = None,
+    tags: list[str] | None = None,
+    decay_alpha: float = 0.0,
+    detail: str = "summary",
+    tag_mode: str = "any",
+) -> dict[str, Any]:
+    """Find memories semantically similar to the query (CR #16).
+
+    Bumps last_accessed on every returned row (search = recall), at every
+    detail level — same contract as search_memories.
+
+    Args:
+        query: Free-text — embedded via the configured backend.
+        top_k: Max results (default 10, hard cap 100).
+        min_similarity: Filter out cosine similarities below this (0..1).
+        category: Optional category filter.
+        tags: Optional tag filter (see tag_mode).
+        decay_alpha: Time-decay aggressiveness (Anderson/ACT-R power-law).
+            0 = no decay (pure semantic), 0.5 = gentle, 1.0 = aggressive.
+            Final score = similarity * (1 + days_since_last_access)^(-alpha).
+        detail: 'index' (one scan line per hit), 'summary' (default),
+            'excerpt' (+ first ~280 chars of body), 'full' (+ whole body).
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
+    """
+    if (err := _validate_detail(detail)):
+        return {"error": err}
+    results, error = _semantic_candidates(
+        query, top_k, min_similarity, category, tags, decay_alpha, tag_mode)
+    if error:
+        return error
+
+    if results:
+        conn = _connect()
+        try:
+            _bump_memory_accessed(conn, [r["id"] for r in results])
+        finally:
+            conn.close()
+
+    shaped = [_shape_search_hit(r, detail) for r in results]
+    return {"query": query, "count": len(shaped), "results": shaped}
 
 
 @mcp.tool()
@@ -2037,10 +2256,14 @@ def hybrid_search_memories(
     tags: list[str] | None = None,
     decay_alpha: float = 0.0,
     match_mode: str = "any",
+    detail: str = "summary",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
     """Combine structural LIKE filters with semantic similarity (CR #17).
 
     Realises the "WHERE field LIKE OR similarity > N" pattern in one query.
+    Bumps last_accessed on every returned row (search = recall), at every
+    detail level — same contract as search_memories.
 
     Args:
         query: Semantic query — embedded.
@@ -2051,6 +2274,9 @@ def hybrid_search_memories(
             OR semantic-similarity (similarity > min_similarity); 'all'
             requires BOTH (memory must hit the LIKE *and* exceed
             min_similarity).
+        detail: 'index' (one scan line per hit), 'summary' (default),
+            'excerpt' (+ first ~280 chars of body), 'full' (+ whole body).
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
         top_k, min_similarity, category, tags, decay_alpha: see
             semantic_search_memories.
     """
@@ -2060,6 +2286,8 @@ def hybrid_search_memories(
         return {"error": "query is required"}
     if match_mode not in ("any", "all"):
         return {"error": "match_mode must be 'any' or 'all'"}
+    if (err := _validate_detail(detail)):
+        return {"error": err}
     top_k = max(1, min(top_k, 100))
 
     try:
@@ -2080,15 +2308,9 @@ def hybrid_search_memories(
                 return {"error": f"unknown category '{category}'"}
             base_wheres.append("m.category_id = ?")
             base_params.append(cat_id)
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                ph = ",".join("?" * len(clean_tags))
-                base_wheres.append(
-                    f"m.id IN (SELECT memory_id FROM memory_tags "
-                    f"WHERE tag_name IN ({ph}))"
-                )
-                base_params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("memory_tags", "memory_id", "m", tags, tag_mode)
+        if tag_sql:
+            base_wheres.append(tag_sql); base_params.extend(tag_params)
 
         # Hybrid filter: combine LIKE and similarity per match_mode.
         like_clauses: list[str] = []
@@ -2133,6 +2355,7 @@ def hybrid_search_memories(
             results.append({
                 "id": r["id"],
                 "summary": r["summary"],
+                "body": r["body"],
                 "category": _category_name(conn, r["category_id"]),
                 "importance": r["importance"],
                 "nickname": r["nickname"],
@@ -2150,15 +2373,20 @@ def hybrid_search_memories(
 
         results.sort(key=lambda d: d["score"], reverse=True)
         results = results[:top_k]
+        _bump_memory_accessed(conn, [r["id"] for r in results])
+        shaped = [_shape_search_hit(r, detail) for r in results]
         return {
             "query": query,
             "like_text": like_text,
             "match_mode": match_mode,
-            "count": len(results),
-            "results": results,
+            "count": len(shaped),
+            "results": shaped,
         }
     finally:
         conn.close()
+
+
+_TIKTOKEN_ENC: Any = None
 
 
 def _estimate_tokens(text: str) -> int:
@@ -2167,23 +2395,52 @@ def _estimate_tokens(text: str) -> int:
     """
     if not text:
         return 0
+    global _TIKTOKEN_ENC
     try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")  # GPT-4 / Claude-ish
-        return len(enc.encode(text))
-    except (ImportError, Exception):
+        if _TIKTOKEN_ENC is None:
+            import tiktoken
+            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")  # GPT-4 / Claude-ish
+        return len(_TIKTOKEN_ENC.encode(text))
+    except Exception:
         return max(1, len(text) // 4)
+
+
+# Graduated packing thresholds for bulk_load_context: the top-ranked
+# memories load at full detail until this fraction of the budget is spent,
+# then excerpts, then one-line index entries. Depth where relevance is
+# highest, breadth on the tail.
+BULK_FULL_FRAC = 0.55
+BULK_EXCERPT_FRAC = 0.85
+_BULK_DEMOTE = {"full": "excerpt", "excerpt": "index"}
+_BULK_INDEX_HEADER = "--- further relevant memories (index only; get_memory(id) for detail) ---\n"
+
+
+def _bulk_block(c: dict[str, Any], level: str) -> str:
+    """Render one candidate at the given detail level for bulk_load."""
+    ref = f"#{c['id']}{('-' + c['nickname']) if c['nickname'] else ''}"
+    if level == "index":
+        return f"{ref}  [{c['category']}]  {_truncate(c['summary'], INDEX_TRUNC_CHARS)}\n"
+    lines = [f"{ref}  [{c['category']}]  (score {c['score']:.3f}, sim {c['similarity']:.3f})",
+             c["summary"]]
+    body = c.get("body")
+    if body and level in ("full", "excerpt"):
+        lines.append(body if level == "full" else _truncate(body, EXCERPT_BODY_CHARS))
+    if c.get("tags"):
+        lines.append("tags: " + ", ".join(c["tags"]))
+    return "\n".join(lines) + "\n---\n"
 
 
 @mcp.tool()
 def bulk_load_context(
     query: str,
-    max_tokens: int = 50000,
+    max_tokens: int = 18000,
     min_similarity: float = 0.3,
     category: str | None = None,
     tags: list[str] | None = None,
     decay_alpha: float = 0.3,
     include_body: bool = True,
+    detail: str = "graduated",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
     """Fetch the most-relevant memories for a role/topic prompt, ordered
     and packed into a context-sparing format up to a token budget
@@ -2193,103 +2450,103 @@ def bulk_load_context(
     prompt; it calls this tool to load a coherent slice of the human's
     durable memory store, returning text it can read directly.
 
+    Memories packed at full or excerpt detail count as recall and bump
+    last_accessed; index-line entries don't.
+
     Args:
         query: The role / topic description. Embedded, used for semantic
             ranking.
         max_tokens: Token budget for the returned `formatted` blob
-            (default 50k, cap 200k). Results are truncated to fit.
+            (default 18k, cap 60k). CAUTION (CR #34): many MCP clients cap
+            an inline tool result around ~25k tokens — budgets much above
+            ~20k risk the result spilling to a file instead of returning
+            inline. The default is sized to come back inline.
         min_similarity: Filter results below this cosine similarity
             (default 0.3 — practical threshold for "actually relevant").
         category: Optional category filter.
-        tags: Optional ANY-match tag filter.
+        tags: Optional tag filter (see tag_mode).
         decay_alpha: Time-decay (Anderson/ACT-R). Default 0.3 — gently
             prefer recent. Set 0 to disable.
-        include_body: If True, include the body of each memory in the
-            formatted output; if False, summaries only (much more memories
-            fit in the budget).
+        include_body: Deprecated (kept for compatibility) — passing False
+            behaves like detail='summary'. Prefer `detail`.
+        detail: Packing mode for the formatted blob:
+            'graduated' (default) — top-ranked memories at full detail
+            until ~55% of budget, then excerpts until ~85%, then one-line
+            index entries: depth where relevance is highest, breadth on
+            the tail. Or a uniform level: 'full', 'excerpt', 'summary',
+            'index'.
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
     """
-    if EMBED_BACKEND == "none":
-        return {"error": "embeddings disabled; set ZETA_EMBED_BACKEND in .env"}
     if not query or not query.strip():
         return {"error": "query is required"}
-    max_tokens = max(100, min(max_tokens, 200_000))
+    if detail != "graduated" and (err := _validate_detail(detail)):
+        return {"error": err.replace("must be one of", "must be 'graduated' or one of")}
+    max_tokens = max(100, min(max_tokens, 60_000))
+    if not include_body and detail == "graduated":
+        detail = "summary"  # legacy include_body=False callers
 
     # Over-fetch generously — we'll pack as many as fit in the budget.
-    search = semantic_search_memories(
-        query=query,
-        top_k=100,  # bring back a wide candidate set; we filter by budget
-        min_similarity=min_similarity,
-        category=category,
-        tags=tags,
-        decay_alpha=decay_alpha,
-    )
-    if "error" in search:
-        return search
+    candidates, error = _semantic_candidates(
+        query, top_k=100, min_similarity=min_similarity, category=category,
+        tags=tags, decay_alpha=decay_alpha, tag_mode=tag_mode)
+    if error:
+        return error
 
-    candidates = search["results"]
-    if not candidates:
-        return {
-            "query": query,
-            "max_tokens": max_tokens,
-            "loaded_count": 0,
-            "skipped_count": 0,
-            "tokens_used": 0,
-            "formatted": "",
-        }
-
-    # Need bodies to format with body — re-fetch in a single query.
-    if include_body:
-        conn = _connect()
-        try:
-            ids = tuple(c["id"] for c in candidates)
-            ph = ",".join("?" * len(ids))
-            body_rows = conn.execute(
-                f"SELECT id, body FROM memories WHERE id IN ({ph})",
-                ids,
-            ).fetchall()
-            body_by_id = {r["id"]: r["body"] for r in body_rows}
-        finally:
-            conn.close()
-    else:
-        body_by_id = {}
-
-    # Pack into budget. Format per memory:
-    #   #<id>-<nickname?>  [category]  (score 0.8123)
-    #   <summary>
-    #   <body if include_body and present>
-    #   ---
     chunks: list[str] = []
     tokens_used = 0
-    loaded = 0
     skipped = 0
+    detail_counts = {"full": 0, "excerpt": 0, "summary": 0, "index": 0}
+    recalled_ids: list[int] = []  # packed at full/excerpt -> bump last_accessed
+    index_header_emitted = False
     for c in candidates:
-        header = f"#{c['id']}{('-' + c['nickname']) if c['nickname'] else ''}  [{c['category']}]  (score {c['score']:.3f}, sim {c['similarity']:.3f})"
-        lines = [header, c["summary"]]
-        if include_body:
-            body = body_by_id.get(c["id"])
-            if body:
-                lines.append(body)
-        if c.get("tags"):
-            lines.append("tags: " + ", ".join(c["tags"]))
-        block = "\n".join(lines) + "\n---\n"
-        block_tokens = _estimate_tokens(block)
-        if tokens_used + block_tokens > max_tokens:
+        if detail == "graduated":
+            frac = tokens_used / max_tokens
+            level = ("full" if frac < BULK_FULL_FRAC
+                     else "excerpt" if frac < BULK_EXCERPT_FRAC
+                     else "index")
+        else:
+            level = detail
+        # Pack at the target level; in graduated mode an oversize block
+        # demotes (full -> excerpt -> index) instead of being skipped.
+        while True:
+            block = _bulk_block(c, level)
+            extra = ""
+            if level == "index" and not index_header_emitted:
+                extra = _BULK_INDEX_HEADER
+            block_tokens = _estimate_tokens(extra + block)
+            if tokens_used + block_tokens <= max_tokens:
+                chunks.append(extra + block)
+                tokens_used += block_tokens
+                detail_counts[level] += 1
+                if extra:
+                    index_header_emitted = True
+                if level in ("full", "excerpt"):
+                    recalled_ids.append(c["id"])
+                break
+            if detail == "graduated" and level in _BULK_DEMOTE:
+                level = _BULK_DEMOTE[level]
+                continue
             skipped += 1
-            continue
-        chunks.append(block)
-        tokens_used += block_tokens
-        loaded += 1
+            break
+
+    if recalled_ids:
+        conn = _connect()
+        try:
+            _bump_memory_accessed(conn, recalled_ids)
+        finally:
+            conn.close()
 
     formatted = "".join(chunks).rstrip()
     return {
         "query": query,
         "max_tokens": max_tokens,
         "tokens_used": tokens_used,
-        "loaded_count": loaded,
+        "loaded_count": sum(detail_counts.values()),
+        "detail_counts": {k: v for k, v in detail_counts.items() if v},
         "skipped_count": skipped,
         "candidates_considered": len(candidates),
         "decay_alpha": decay_alpha,
-        "include_body": include_body,
+        "detail": detail,
         "formatted": formatted,
     }
 
@@ -2318,8 +2575,11 @@ def add_task(
         summary: Short form (required). Aim for ≤ 250 chars; hard cap
             is 400. Going over 250 is silently accepted, but the response
             includes `summary_length` so you can self-calibrate without
-            being rejected. Past the 400 hard cap the error message
-            includes the measured length, so you can trim once precisely.
+            being rejected. Past the 400 hard cap the call still succeeds
+            (CR #33): the summary is stored truncated, the body is stored
+            intact, and the response carries `summary_truncated` +
+            `original_summary_length` — fix with update_task(id,
+            summary=...) without resending the body.
         category: Must already exist.
         body: Optional long-form detail. Use when there's context,
             sub-steps, background, or links to capture. If
@@ -2364,7 +2624,8 @@ def add_task(
             if salvaged.get("session_id") is not None and session_id is None:
                 session_id = salvaged["session_id"]; recovered["session_id"] = session_id
 
-    if (err := _validate_summary(summary)):
+    stored_summary, truncation, err = _prepare_summary(summary, "update_task")
+    if err:
         return {"error": err}
     if (err := _validate_importance(importance)):
         return {"error": err}
@@ -2389,7 +2650,7 @@ def add_task(
                 ) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    summary.strip(),
+                    stored_summary,
                     body,
                     cat_id,
                     importance,
@@ -2412,7 +2673,7 @@ def add_task(
 
         # CR #20 audit
         _audit_create(conn, "task", task_id, {
-            "summary": summary.strip(),
+            "summary": stored_summary,
             "body": body,
             "importance": importance,
             "due_date": due_date,
@@ -2428,8 +2689,10 @@ def add_task(
             "id": task_id,
             "nickname": cleaned_nick,
             "created_at": now,
-            "summary_length": len(summary.strip()),
+            "summary_length": len(stored_summary),
         }
+        if truncation:
+            out.update(truncation)
         if recovered:
             out["recovered_from_body"] = recovered
         return out
@@ -2555,7 +2818,7 @@ def update_task(
             _audit_tag_change(conn, "task", id, old_tags, tags, session_pk)
 
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (id,)).fetchone()
-        return _hydrate_task(conn, row, full=True)
+        return _hydrate_task(conn, row, detail="full")
     finally:
         conn.close()
 
@@ -2604,19 +2867,27 @@ def list_tasks(
     tags: list[str] | None = None,
     due_before: str | None = None,
     limit: int = 20,
+    detail: str = "summary",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
-    """List tasks (summary view).
+    """List tasks.
 
     Defaults to status='open'. Pass status=None to include everything.
 
     Args:
         category: Filter by category.
         status: One of 'open', 'in_progress', 'blocked', 'done', 'cancelled', or None for all.
-        tags: ANY-match tag filter.
+        tags: Tag filter (see tag_mode).
         due_before: ISO-8601 string; only tasks with due_date < this.
         limit: Max rows, default 20, hard cap 200.
+        detail: 'index' (one scan line per row), 'summary' (default),
+            'excerpt' (summary + first ~280 chars of body), 'full'
+            (everything).
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
     """
     limit = max(1, min(limit, LIST_HARD_LIMIT))
+    if (err := _validate_detail(detail)):
+        return {"error": err}
     conn = _connect()
     try:
         wheres: list[str] = []
@@ -2634,23 +2905,15 @@ def list_tasks(
         if due_before is not None:
             wheres.append("t.due_date IS NOT NULL AND t.due_date < ?")
             params.append(due_before)
-        if tags:
-            clean_tags = [tt.strip().lower() for tt in tags if tt.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"t.id IN (SELECT task_id FROM task_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("task_tags", "task_id", "t", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
         params.append(limit)
         rows = conn.execute(
             f"""
-            SELECT t.id, t.summary, t.category_id, t.status, t.importance,
-                   t.due_date, t.requested_by_human, t.nickname,
-                   t.updated_at, t.completed_at
+            SELECT t.*
             FROM tasks t
             {where_sql}
             ORDER BY
@@ -2664,7 +2927,7 @@ def list_tasks(
             params,
         ).fetchall()
         return {
-            "tasks": [_hydrate_task(conn, r, full=False) for r in rows],
+            "tasks": [_hydrate_task(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
@@ -2679,7 +2942,7 @@ def get_task(id: int) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (id,)).fetchone()
         if row is None:
             return {"error": "not found"}
-        return _hydrate_task(conn, row, full=True)
+        return _hydrate_task(conn, row, detail="full")
     finally:
         conn.close()
 
@@ -2691,8 +2954,10 @@ def search_tasks(
     status: str | None = "open",
     tags: list[str] | None = None,
     limit: int = 10,
+    detail: str = "summary",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
-    """Keyword search across task summary and body (summary view).
+    """Keyword search across task summary and body.
 
     Case-insensitive LIKE on summary AND body. Defaults to open tasks
     only; pass `status=None` to search across all statuses.
@@ -2702,12 +2967,18 @@ def search_tasks(
         category: Optional category filter.
         status: One of 'open', 'in_progress', 'blocked', 'done', 'cancelled', or None for all.
             Defaults to 'open'.
-        tags: ANY-match tag filter.
+        tags: Tag filter (see tag_mode).
         limit: Default 10, hard-capped at SEARCH_HARD_LIMIT.
+        detail: 'index' (one scan line per row), 'summary' (default),
+            'excerpt' (summary + first ~280 chars of body), 'full'
+            (everything — saves a get_task round trip per hit).
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
     """
     if not query or not query.strip():
         return {"error": "query is required"}
     limit = max(1, min(limit, SEARCH_HARD_LIMIT))
+    if (err := _validate_detail(detail)):
+        return {"error": err}
     like = f"%{query.strip()}%"
 
     conn = _connect()
@@ -2726,22 +2997,14 @@ def search_tasks(
             if cat_id is None:
                 return {"error": f"unknown category '{category}'"}
             wheres.append("t.category_id = ?"); params.append(cat_id)
-        if tags:
-            clean_tags = [tt.strip().lower() for tt in tags if tt.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"t.id IN (SELECT task_id FROM task_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("task_tags", "task_id", "t", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         params.append(limit)
         rows = conn.execute(
             f"""
-            SELECT t.id, t.summary, t.category_id, t.status, t.importance,
-                   t.due_date, t.requested_by_human, t.nickname,
-                   t.updated_at, t.completed_at
+            SELECT t.*
             FROM tasks t
             WHERE {' AND '.join(wheres)}
             ORDER BY
@@ -2753,7 +3016,7 @@ def search_tasks(
             params,
         ).fetchall()
         return {
-            "tasks": [_hydrate_task(conn, r, full=False) for r in rows],
+            "tasks": [_hydrate_task(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
@@ -3182,6 +3445,8 @@ def list_chat(
     tags: list[str] | None = None,
     author_nickname: str | None = None,
     limit: int = 20,
+    detail: str = "full",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
     """Browse the group chat. Most-recent first.
 
@@ -3194,12 +3459,18 @@ def list_chat(
             mechanism. Track `max(returned_ids)` after each call to use
             as the next call's `after_id`. Cheaper and more reliable
             than `since` for incremental polling.
-        tags: ANY-match tag filter. To find "messages addressed to me,"
-            pass tags=['for-<your-nickname>'].
+        tags: Tag filter (see tag_mode). To find "messages addressed to
+            me," pass tags=['for-<your-nickname>'].
         author_nickname: Filter to messages from a specific author.
         limit: Default 20, hard-capped at LIST_HARD_LIMIT.
+        detail: 'full' (default — whole bodies; the body IS the content),
+            'excerpt' (~280-char bodies) or 'index' (~100-char scan lines)
+            for skimming long channels before pulling specific messages.
+        tag_mode: 'any' (default) or 'all' (message must carry every tag).
     """
     limit = max(1, min(limit, LIST_HARD_LIMIT))
+    if (err := _validate_detail(detail, ("index", "excerpt", "full"))):
+        return {"error": err}
     conn = _connect()
     try:
         wheres: list[str] = []
@@ -3212,15 +3483,9 @@ def list_chat(
             wheres.append("c.id > ?"); params.append(after_id)
         if author_nickname is not None:
             wheres.append("c.author_nickname = ?"); params.append(author_nickname.strip())
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"c.id IN (SELECT chat_id FROM group_chat_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("group_chat_tags", "chat_id", "c", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
         params.append(limit)
@@ -3236,7 +3501,7 @@ def list_chat(
             params,
         ).fetchall()
         return {
-            "messages": [_hydrate_chat(conn, r) for r in rows],
+            "messages": [_hydrate_chat(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
@@ -3249,18 +3514,25 @@ def search_chat(
     channel: str | None = None,
     tags: list[str] | None = None,
     limit: int = 10,
+    detail: str = "full",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
     """Keyword search across chat message bodies.
 
     Args:
         query: Search string (case-insensitive LIKE on body + author_nickname).
         channel: Optional channel filter.
-        tags: ANY-match tag filter.
+        tags: Tag filter (see tag_mode).
         limit: Default 10, hard-capped at SEARCH_HARD_LIMIT.
+        detail: 'full' (default), 'excerpt' (~280-char bodies) or 'index'
+            (~100-char scan lines).
+        tag_mode: 'any' (default) or 'all' (message must carry every tag).
     """
     if not query or not query.strip():
         return {"error": "query is required"}
     limit = max(1, min(limit, SEARCH_HARD_LIMIT))
+    if (err := _validate_detail(detail, ("index", "excerpt", "full"))):
+        return {"error": err}
     like = f"%{query.strip()}%"
     conn = _connect()
     try:
@@ -3268,15 +3540,9 @@ def search_chat(
         params: list[Any] = [like, like]
         if channel is not None:
             wheres.append("c.channel = ?"); params.append(channel.strip().lower())
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"c.id IN (SELECT chat_id FROM group_chat_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter("group_chat_tags", "chat_id", "c", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         params.append(limit)
         rows = conn.execute(
@@ -3291,7 +3557,7 @@ def search_chat(
             params,
         ).fetchall()
         return {
-            "messages": [_hydrate_chat(conn, r) for r in rows],
+            "messages": [_hydrate_chat(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
@@ -3512,7 +3778,7 @@ def update_journal_entry(
         row = conn.execute(
             "SELECT * FROM journal_entries WHERE id = ?", (id,)
         ).fetchone()
-        return _hydrate_journal(conn, row, full=True)
+        return _hydrate_journal(conn, row, detail="full")
     finally:
         conn.close()
 
@@ -3554,8 +3820,10 @@ def list_journal_entries(
     until: str | None = None,
     tags: list[str] | None = None,
     limit: int = 50,
+    detail: str = "summary",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
-    """Browse journal entries (summary view: id, entry_type, timestamp, tags).
+    """Browse journal entries.
 
     Most-recent first. Use `entry_type` with a prefix-match wildcard for
     domain queries: e.g. `entry_type='exercise:%'` to see all exercise.
@@ -3564,10 +3832,16 @@ def list_journal_entries(
         entry_type: Exact value OR a SQL LIKE pattern (with %). Omit for all.
         since: ISO-8601 cutoff on timestamp (inclusive).
         until: ISO-8601 cutoff on timestamp (exclusive).
-        tags: ANY-match tag filter.
+        tags: Tag filter (see tag_mode).
         limit: Default 50, hard-capped at LIST_HARD_LIMIT.
+        detail: 'index' (id + entry_type + timestamp only), 'summary'
+            (default — + tags), 'excerpt' (+ first ~280 chars of notes +
+            metrics), 'full' (everything).
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
     """
     limit = max(1, min(limit, LIST_HARD_LIMIT))
+    if (err := _validate_detail(detail)):
+        return {"error": err}
     conn = _connect()
     try:
         wheres: list[str] = []
@@ -3582,15 +3856,10 @@ def list_journal_entries(
             wheres.append("e.timestamp >= ?"); params.append(since)
         if until is not None:
             wheres.append("e.timestamp < ?"); params.append(until)
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"e.id IN (SELECT entry_id FROM journal_entry_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter(
+            "journal_entry_tags", "entry_id", "e", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
         params.append(limit)
@@ -3606,7 +3875,7 @@ def list_journal_entries(
             params,
         ).fetchall()
         return {
-            "entries": [_hydrate_journal(conn, r, full=False) for r in rows],
+            "entries": [_hydrate_journal(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
@@ -3619,18 +3888,25 @@ def search_journal_entries(
     entry_type: str | None = None,
     tags: list[str] | None = None,
     limit: int = 10,
+    detail: str = "full",
+    tag_mode: str = "any",
 ) -> dict[str, Any]:
-    """Keyword search across journal notes (full view returned).
+    """Keyword search across journal notes (full view by default).
 
     Args:
         query: Search string (LIKE on notes and metrics JSON text).
         entry_type: Exact value or LIKE pattern.
-        tags: ANY-match tag filter.
+        tags: Tag filter (see tag_mode).
         limit: Default 10, hard-capped at SEARCH_HARD_LIMIT.
+        detail: 'full' (default — long-standing behaviour for this tool),
+            'excerpt', 'summary', or 'index' for tighter views.
+        tag_mode: 'any' (default) or 'all' (row must carry every tag).
     """
     if not query or not query.strip():
         return {"error": "query is required"}
     limit = max(1, min(limit, SEARCH_HARD_LIMIT))
+    if (err := _validate_detail(detail)):
+        return {"error": err}
     like = f"%{query.strip()}%"
     conn = _connect()
     try:
@@ -3642,15 +3918,10 @@ def search_journal_entries(
                 wheres.append("e.entry_type LIKE ?"); params.append(et)
             else:
                 wheres.append("e.entry_type = ?"); params.append(et)
-        if tags:
-            clean_tags = [t.strip().lower() for t in tags if t.strip()]
-            if clean_tags:
-                placeholders = ",".join("?" * len(clean_tags))
-                wheres.append(
-                    f"e.id IN (SELECT entry_id FROM journal_entry_tags "
-                    f"WHERE tag_name IN ({placeholders}))"
-                )
-                params.extend(clean_tags)
+        tag_sql, tag_params = _tag_filter(
+            "journal_entry_tags", "entry_id", "e", tags, tag_mode)
+        if tag_sql:
+            wheres.append(tag_sql); params.extend(tag_params)
 
         params.append(limit)
         rows = conn.execute(
@@ -3665,7 +3936,7 @@ def search_journal_entries(
             params,
         ).fetchall()
         return {
-            "entries": [_hydrate_journal(conn, r, full=True) for r in rows],
+            "entries": [_hydrate_journal(conn, r, detail=detail) for r in rows],
             "count": len(rows),
         }
     finally:
