@@ -2413,6 +2413,13 @@ BULK_FULL_FRAC = 0.55
 BULK_EXCERPT_FRAC = 0.85
 _BULK_DEMOTE = {"full": "excerpt", "excerpt": "index"}
 _BULK_INDEX_HEADER = "--- further relevant memories (index only; get_memory(id) for detail) ---\n"
+# Transport guard (CR #34 follow-up, calibrated 2026-06-10 against Claude
+# Code's inline tool-result cap): a ~44 KB formatted blob returned inline,
+# ~52 KB spilled to a file. The packer enforces this char ceiling on
+# `formatted` ALONGSIDE the token budget, so a caller raising max_tokens
+# can't silently outrun the transport whatever the content's
+# chars-per-token density. Raise it only if your MCP client carries more.
+BULK_MAX_CHARS = int(_env("ZETA_BULK_MAX_CHARS", "45000") or "45000")
 
 
 def _bulk_block(c: dict[str, Any], level: str) -> str:
@@ -2433,7 +2440,7 @@ def _bulk_block(c: dict[str, Any], level: str) -> str:
 @mcp.tool()
 def bulk_load_context(
     query: str,
-    max_tokens: int = 18000,
+    max_tokens: int = 12000,
     min_similarity: float = 0.3,
     category: str | None = None,
     tags: list[str] | None = None,
@@ -2457,10 +2464,13 @@ def bulk_load_context(
         query: The role / topic description. Embedded, used for semantic
             ranking.
         max_tokens: Token budget for the returned `formatted` blob
-            (default 18k, cap 60k). CAUTION (CR #34): many MCP clients cap
-            an inline tool result around ~25k tokens — budgets much above
-            ~20k risk the result spilling to a file instead of returning
-            inline. The default is sized to come back inline.
+            (default 12k, cap 60k). CAUTION (CR #34): MCP clients cap the
+            inline tool result — calibrated against Claude Code, ~44 KB
+            returns inline and ~52 KB spills to a file. The default is
+            sized to come back inline; independent of this budget, the
+            packer also stops at ZETA_BULK_MAX_CHARS (default 45000)
+            characters so a generous token budget can't outrun the
+            transport.
         min_similarity: Filter results below this cosine similarity
             (default 0.3 — practical threshold for "actually relevant").
         category: Optional category filter.
@@ -2474,7 +2484,8 @@ def bulk_load_context(
             until ~55% of budget, then excerpts until ~85%, then one-line
             index entries: depth where relevance is highest, breadth on
             the tail. Or a uniform level: 'full', 'excerpt', 'summary',
-            'index'.
+            'index' ('index' fits ~100 memories in under ~4k tokens — a
+            cheap whole-store orientation sweep).
         tag_mode: 'any' (default) or 'all' (row must carry every tag).
     """
     if not query or not query.strip():
@@ -2494,6 +2505,7 @@ def bulk_load_context(
 
     chunks: list[str] = []
     tokens_used = 0
+    chars_used = 0
     skipped = 0
     detail_counts = {"full": 0, "excerpt": 0, "summary": 0, "index": 0}
     recalled_ids: list[int] = []  # packed at full/excerpt -> bump last_accessed
@@ -2511,12 +2523,14 @@ def bulk_load_context(
         while True:
             block = _bulk_block(c, level)
             extra = ""
-            if level == "index" and not index_header_emitted:
+            if detail == "graduated" and level == "index" and not index_header_emitted:
                 extra = _BULK_INDEX_HEADER
             block_tokens = _estimate_tokens(extra + block)
-            if tokens_used + block_tokens <= max_tokens:
+            if (tokens_used + block_tokens <= max_tokens
+                    and chars_used + len(extra + block) <= BULK_MAX_CHARS):
                 chunks.append(extra + block)
                 tokens_used += block_tokens
+                chars_used += len(extra + block)
                 detail_counts[level] += 1
                 if extra:
                     index_header_emitted = True
@@ -2541,6 +2555,7 @@ def bulk_load_context(
         "query": query,
         "max_tokens": max_tokens,
         "tokens_used": tokens_used,
+        "chars_used": len(formatted),
         "loaded_count": sum(detail_counts.values()),
         "detail_counts": {k: v for k, v in detail_counts.items() if v},
         "skipped_count": skipped,

@@ -1456,15 +1456,21 @@ else:
           bulk_ranked["formatted"].startswith(f"#{m_db['id']}")
           and "ACID" in bulk_ranked["formatted"])
 
-    # CR #34: the default budget must be inline-safe (18k, capped at 60k).
+    # CR #34: the default budget must be inline-safe (12k, capped at 60k),
+    # and the char ceiling guards the transport independently of tokens.
     bulk_default = bulk_load_context(query="database engines and storage",
                                      min_similarity=0.0)
-    check("bulk_load_context default budget is 18k (CR #34)",
-          bulk_default.get("max_tokens") == 18000)
+    check("bulk_load_context default budget is 12k (CR #34)",
+          bulk_default.get("max_tokens") == 12000)
+    check("bulk_load_context reports chars_used under the transport ceiling",
+          isinstance(bulk_default.get("chars_used"), int)
+          and bulk_default["chars_used"] <= 45000)
     bulk_capped = bulk_load_context(query="database engines and storage",
                                     max_tokens=999_999, min_similarity=0.0)
     check("bulk_load_context caps the budget at 60k",
           bulk_capped.get("max_tokens") == 60000)
+    check("char ceiling binds even at the 60k token cap",
+          bulk_capped.get("chars_used", 0) <= 45000)
 
     # A tiny budget forces graduated demotion: blocks that don't fit at
     # full detail land as excerpts/index lines instead of being skipped.

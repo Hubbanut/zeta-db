@@ -48,7 +48,7 @@ every listed tag).
 - `get_memory(id)` — full row including body. **Recall**; bumps `last_accessed`.
 - `semantic_search_memories(query, top_k=10, min_similarity=0, category?, tags?, decay_alpha=0, detail='summary', tag_mode='any')` — vector-similarity search (CR #16). Requires `ZETA_EMBED_BACKEND=openai`. `decay_alpha>0` adds Anderson/ACT-R power-law time decay. **Recall**; bumps `last_accessed`.
 - `hybrid_search_memories(query, like_text?, match_mode='any', top_k=10, detail='summary', ...)` — combines LIKE + similarity in one query (CR #17). `match_mode='any'` returns rows matching either; `'all'` requires both. **Recall**; bumps `last_accessed`.
-- `bulk_load_context(query, max_tokens=18000, decay_alpha=0.3, detail='graduated', ...)` — fetch most-relevant memories for a role/topic up to a token budget, formatted as context-sparing text. The `z load` verb's tool, designed for new-session warmup. Default packing is **graduated**: top-ranked memories in full, then excerpts, then one-line index entries — depth where relevance is highest, breadth on the tail. The 18k default budget returns inline (CR #34 — budgets much above ~20k risk spilling past the client's tool-result cap); rows packed at full/excerpt count as recall.
+- `bulk_load_context(query, max_tokens=12000, decay_alpha=0.3, detail='graduated', ...)` — fetch most-relevant memories for a role/topic up to a token budget, formatted as context-sparing text. The `z load` verb's tool, designed for new-session warmup. Default packing is **graduated**: top-ranked memories in full, then excerpts, then one-line index entries — depth where relevance is highest, breadth on the tail. The 12k default returns inline (CR #34, calibrated 2026-06-10: ~44 KB inline, ~52 KB spills); a `ZETA_BULK_MAX_CHARS` (45000) ceiling guards the transport independently of token accounting. `detail='index'` fits ~100 memories in under ~4k tokens — a cheap whole-store orientation sweep. Rows packed at full/excerpt count as recall.
 - `backfill_embeddings(max_rows=100)` — embed any memories with NULL embedding. Use after first enabling `ZETA_EMBED_BACKEND`, or after a model change.
 
 **Tasks** — to-dos with status and optional due dates:
@@ -762,7 +762,7 @@ known verb.
 | `z work begin <text>` | `begin_work(description=<text>)` | start a work log (use prose to convey estimate: "z work begin Investigate flaky test, est 10 min") |
 | `z work done <id>` | `complete_work(id=<id>)` | finish a work log; reports verdict vs estimate |
 | `z audit <type> <id>` | `get_audit_trail(entity_type=<type>, entity_id=<id>)` | history of one entity (memory/task/journal/chat) |
-| `z load <role/topic prompt>` | `bulk_load_context(query=<text>)` | fetch top-relevance memories into an ~18k-token graduated block (top hits in full, then excerpts, then index lines); semantic + time-decay ranked. The session-warmup verb. |
+| `z load <role/topic prompt>` | `bulk_load_context(query=<text>)` | fetch top-relevance memories into an ~12k-token graduated block (top hits in full, then excerpts, then index lines); semantic + time-decay ranked. The session-warmup verb. |
 | `z semsearch <query>` | `semantic_search_memories(query=<text>)` | top-10 memories by semantic similarity |
 | `z hybrid <query> [like:<text>]` | `hybrid_search_memories(query=<text>, like_text=<text>)` | combine LIKE + similarity |
 
